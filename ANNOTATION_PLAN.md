@@ -63,6 +63,12 @@ nano-vllm-annotated 的风格是：**中文注释直接写在源码里**，在�
 ### 1.2 统一约定
 
 - 注释一律用 `#`，**不改原有英文 docstring**（避免影响 `help()`、文档生成，也便于和上游 diff）。中文注释写在 docstring 下方。
+- **英文注释逐条翻译**：源码中原有的英文注释，都在它下面加上中文翻译，以 `# 译：` 开头，和讲解性的注释区分开。
+  - 范围：`#` 注释（包括写在代码行尾的）和 docstring（模块、类、函数的）都要翻译。
+  - 位置：`#` 注释的翻译紧跟在原注释块下面；行尾注释的翻译放在该行代码的下一行；docstring 的翻译放在 docstring 结束之后（模块和类的 docstring 之后 black 会强制空一行，译文放在这个空行之后）。
+  - 要求：忠实翻译原意，不增不减；原文中的标识符、参数名、命令行选项保持英文。需要补充的解释另起一段讲解性注释，不混进译文。docstring 中的 `Args:` / `Returns:` / `Raises:` 等小节照样逐项翻译。
+  - 不翻译：文件开头的许可证声明、工具指令（如 `# noqa`、`# type: ignore`、`# fmt: off`）、被注释掉的代码。
+  - 与等级无关：B、C 级文件中的英文注释同样要全部翻译。
 - **Shape 记号**全项目统一，定义在第一个注释的文件（`models/qwen3.py`）中，其他文件引用即可：
 
   ```text
@@ -160,6 +166,8 @@ nano-vllm-annotated 的风格是：**中文注释直接写在源码里**，在�
 一般需要详细解释的：本仓库特有的设计和其中的隐含约定、跨线程/跨 stream 的时序和同步、索引与形状变换、缓冲区复用、padding 和边界情况、为了性能做的取舍（为什么不用更直观的写法）、画像中“还不了解”的全部内容。
 
 画像只用来判断详略。注释正文**不提 nano-vllm、不做对比**，直接讲 TokenSpeed 本身。
+
+英文注释的翻译（`# 译：`，见 1.2）不受详略判断影响：不管内容对读者是否已知，原有英文注释都要完整翻译；详略只针对新增的讲解性注释。
 
 ### 1.6 规模估计
 
@@ -518,8 +526,8 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 
 ## 5. 进度
 
-- [ ] 第 0 阶段：术语表
-- [ ] 第 1 阶段：模型骨架
+- [x] 第 0 阶段：术语表
+- [x] 第 1 阶段：模型骨架
 - [ ] 第 2 阶段：基础层零件
 - [ ] 第 3 阶段：注意力与 KV cache 主线
 - [ ] 第 4 阶段：一次前向的组织
@@ -543,21 +551,21 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 
 ## 附录 A：全量文件清单
 
-`python/tokenspeed/` 下全部 487 个 `.py` 文件，按阶段分组，组内按等级（S → A → B → C）排序。路径相对于 `python/tokenspeed/`。新增或删除文件时同步更新本表。
+`python/tokenspeed/` 下全部 487 个 `.py` 文件，按阶段分组，组内按等级（S → A → B → C）排序。路径相对于 `python/tokenspeed/`。新增或删除文件时同步更新本表。等级后标 ✅ 表示该文件已完成注释（含英文注释的翻译）。
 
 ### 第 1 阶段：模型骨架（9 个文件）
 
 | 文件 | 行数 | 等级 |
 | --- | --- | --- |
-| `runtime/models/base/decoder_layer.py` | 250 | S |
-| `runtime/models/base/transformer_model.py` | 195 | S |
-| `runtime/models/qwen3.py` | 255 | S |
-| `runtime/models/base/causal_lm.py` | 692 | A |
-| `runtime/configs/qwen3_config.py` | 246 | B |
-| `runtime/models/llama.py` | 220 | B |
-| `runtime/models/registry.py` | 128 | B |
-| `runtime/models/base/__init__.py` | 33 | C |
-| `runtime/models/utils.py` | 47 | C |
+| `runtime/models/base/decoder_layer.py` | 250 | S ✅ |
+| `runtime/models/base/transformer_model.py` | 195 | S ✅ |
+| `runtime/models/qwen3.py` | 255 | S ✅ |
+| `runtime/models/base/causal_lm.py` | 692 | A ✅ |
+| `runtime/configs/qwen3_config.py` | 246 | B ✅ |
+| `runtime/models/llama.py` | 220 | B ✅ |
+| `runtime/models/registry.py` | 128 | B ✅ |
+| `runtime/models/base/__init__.py` | 33 | C ✅ |
+| `runtime/models/utils.py` | 47 | C ✅ |
 
 ### 第 2 阶段：基础层零件（12 个文件）
 

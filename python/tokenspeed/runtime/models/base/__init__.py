@@ -18,6 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 模型基类的统一导出，具体模型写 `from tokenspeed.runtime.models.base import BaseCausalLM` 即可：
+#   BaseCausalLM：完整模型（主干 + lm_head + LogitsProcessor + 权重加载）
+#   BaseTransformerModel：主干（embedding -> 解码层 -> final norm）
+#   BaseDecoderLayer / BaseMoEDecoderLayer：稠密 / MoE 解码层
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.decoder_layer import (
     BaseDecoderLayer,

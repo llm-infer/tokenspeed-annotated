@@ -20,7 +20,15 @@
 
 """Helpers shared across runtime model implementations."""
 
+# 译：各个运行时模型实现共用的辅助函数。
 
+
+# 各模型共用的小工具。
+#
+# validate_attention_partition：检查注意力头能否按 TP 切分，不能时在构建模型时就报错。
+#   Q 头必须被 tp_size 整除；KV 头多于或等于 tp_size 时也要被整除，
+#   KV 头少于 tp_size 时反过来要求 tp_size 被 KV 头数整除（每个 KV 头复制到若干 rank）。
+#   例：32 个 Q 头、8 个 KV 头：TP=2、4、8 可以；TP=16 也可以（每个 KV 头复制到 2 个 rank）；TP=3 不行。
 def validate_attention_partition(
     total_num_heads: int,
     total_num_kv_heads: int,

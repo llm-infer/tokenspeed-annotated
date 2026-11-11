@@ -20,6 +20,8 @@
 
 """Model registry helpers for resolving runtime model entry classes."""
 
+# 译：用于解析运行时模型入口类的模型注册表辅助代码。
+
 import importlib
 import pkgutil
 from collections.abc import Set
@@ -36,12 +38,27 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
+# 模型注册表：HF 配置里的架构名（config.architectures，例如 "Qwen3ForCausalLM"）-> 模型类。
+#
+# 你在这里：启动时 model_loader/utils.py 的 get_model_architecture 调用
+#   ModelRegistry.resolve_model_cls(architectures)，得到要构建的模型类（第 8 阶段）。
+#
+# 注册表的两个来源：
+#   1. 仓库内的模型：import_model_classes 导入 tokenspeed.runtime.models 下的每个模块，
+#      收集模块级变量 EntryClass（一个类或类的列表），以“类名”作为架构名登记。
+#      所以模型类的名字必须与 HF 配置里的架构名一致（Qwen3ForCausalLM）。
+#   2. 插件注册的模型（plugins/registry.py，第 19 阶段）：外部包可以注册新架构；
+#      如果要替换仓库内已有的同名架构，必须显式声明 override=True，否则报错。
 
+
+# 注册表本体。models 字段保存仓库内的“架构名 -> 模型类”。
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
+    # 译：以 model_arch（架构名）为键
     models: dict[str, type[nn.Module]] = field(default_factory=dict)
 
+    # 所有支持的架构名：仓库内的 + 插件注册的
     def get_supported_archs(self) -> Set[str]:
         return self.models.keys() | registered_architectures()
 
@@ -53,6 +70,8 @@ class _ModelRegistry:
             f"Supported architectures: {all_supported_archs}"
         )
 
+    # 查找一个架构名对应的模型类，找不到返回 None。插件注册的优先，
+    # 但插件与仓库内模型同名而又没有声明 override=True 时报错，避免无意中被替换。
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
         registered = registered_model(model_arch)
         in_tree = self.models.get(model_arch)
@@ -66,6 +85,7 @@ class _ModelRegistry:
             )
         return registered.cls
 
+    # 统一成列表；HF 配置里 architectures 通常是列表，也兼容单个字符串
     def _normalize_archs(
         self,
         architectures: str | list[str],
@@ -77,6 +97,8 @@ class _ModelRegistry:
 
         return architectures
 
+    # 入口：按顺序尝试 architectures 中的每个架构名，返回第一个能找到的 (模型类, 架构名)；
+    # 都找不到时报错，并列出所有支持的架构。
     def resolve_model_cls(
         self,
         architectures: str | list[str],
@@ -91,9 +113,13 @@ class _ModelRegistry:
         return self._raise_for_unsupported(architectures)
 
 
+# 导入 models 包下的所有模块，收集 EntryClass，返回 {类名: 类}。
+# 任何一个模块导入失败都会直接报错（而不是跳过），避免某个模型悄悄不可用。
+# 同名的模型类出现两次也报错。@lru_cache 保证整个进程只扫描一次。
 @lru_cache
 def import_model_classes():
     """Import model modules and collect their ``EntryClass`` exports."""
+    # 译：导入各个模型模块，并收集它们导出的 ``EntryClass``。
     model_arch_name_to_cls = {}
     package_name = "tokenspeed.runtime.models"
     package = importlib.import_module(package_name)
@@ -109,6 +135,7 @@ def import_model_classes():
             if isinstance(
                 entry, list
             ):  # To support multiple model classes in one module
+                # 译：支持一个模块中有多个模型类
                 for tmp in entry:
                     if tmp.__name__ in model_arch_name_to_cls:
                         raise ValueError(
@@ -125,4 +152,5 @@ def import_model_classes():
     return model_arch_name_to_cls
 
 
+# 全局唯一的注册表实例；导入本模块时就会扫描全部模型模块
 ModelRegistry = _ModelRegistry(import_model_classes())
