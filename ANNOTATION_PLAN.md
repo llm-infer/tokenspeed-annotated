@@ -18,7 +18,7 @@ nano-vllm-annotated 的风格是：**中文注释直接写在源码里**，在�
 | 层级 | 位置 | 写什么 |
 | --- | --- | --- |
 | **文件头** | `import` 之后、第一个类/函数之前 | ① `Shape记号`（本文件出现的维度字母）；② `基础概念`（读本文件前需要知道、但读者可能不会的知识）；③ 数据流图；④ 在整条主线中的位置（“上游是谁调用我，下游我调用谁”） |
-| **类头** | `class` 定义上方 | 职责一句话；生命周期/状态图或决策流程图（用 `┌─┐│└┘▼` 画框）；与 nano-vllm 中对应概念的对照 |
+| **类头** | `class` 定义上方 | 职责一句话；生命周期/状态图或决策流程图（用 `┌─┐│└┘▼` 画框） |
 | **函数/方法** | `def` 上方或函数体开头 | 输入输出的形状与含义；分步骤说明；**带具体数字的走查例子** |
 | **行内** | 代码行上方或行尾 | 字段含义、为什么这样做、边界情况（如 padding、`-1` 槽位） |
 
@@ -45,7 +45,6 @@ nano-vllm-annotated 的风格是：**中文注释直接写在源码里**，在�
   - 模型：Qwen3-8B，`H=4096`、`L=36`、Q 头 32、KV 头 8（GQA，每 4 个 Q 头共享 1 个 KV 头）、`D=128`、`intermediate=12288`、`V=151936`。
   - 单卡（TP=1）；`P=64`（示例取值，实际由 cache 计划决定）。
   - 一轮混合批：请求 A 新到达，prompt 300 token；请求 B 已在 decode，当前长度 1000。于是 `B=2`、`E=1`、`T=301`。
-- **与 nano-vllm 对照**：凡是能对上的概念，写一行 `# 对照 nano-vllm：xxx`（例如 `ForwardContext` ↔ `nanovllm/utils/context.py` 的 `Context`；`CachePool` ↔ `ModelRunner.kv_cache`）。读过 nano-vllm 的人可以借此快速迁移。
 - **略读标记**：大文件只注主线。主线以外的分支在入口处加 `# [略读] 投机解码/PD/DP 专用，见第 N 阶段`，读者第一遍可以跳过。
 - **引用设计文档**：设计意图已写在 `docs/design/*.md` 的，注释只写一两句结论，加 `# 详见 docs/design/xxx.md「章节名」`，不整段翻译。
 - **术语**：首次出现时给出“中文（英文原词）”，之后统一用中文。术语表放在 `docs/annotation-glossary.md`（第 0 阶段产出），所有注释保持一致。
@@ -185,10 +184,10 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 | `layers/attention/backends/base.py` | 902 | 主线注（`AttentionBackend`） | 后端的统一接口：`init_forward_metadata` → `forward` 分派到 `forward_extend` / `forward_decode` |
 | `layers/attention/backends/paged/base.py` | 598 | 主线注 | 分页后端的公共逻辑；树投机部分 `[略读]` |
 | `layers/attention/backends/paged/mha.py` | 806 | 全注（树相关除外） | `MHAExtendMetadata` / `MHADecodeMetadata` 各字段；用贯穿例子走查：A 的 300 个 token 怎么做 extend，B 的 1 个 token 怎么通过页表读出 1000 个历史 KV |
-| `layers/attention/backends/paged/write_locations.py` | 320 | 全注 | 每个新 token 的 KV 写到哪个槽位：`slot = page_id * P + offset`（对照 nano-vllm 的 `slot_mapping`） |
+| `layers/attention/backends/paged/write_locations.py` | 320 | 全注 | 每个新 token 的 KV 写到哪个槽位：`slot = page_id * P + offset` |
 | `layers/attention/page_table.py`、`backends/cache_metadata.py` | 90 / 213 | 全注 | 调度器给的 block table 怎么变成 kernel 用的 page table |
 | `layers/attention/kv_cache/base.py` | 428 | 主线注（`CachePool`） | KV 池的抽象；cache group 概念 |
-| `layers/attention/kv_cache/mha.py` | 356 | 全注 | `MHATokenToKVPool` 的显存布局图（对照 nano-vllm `kv_cache[2, L, NP, P, Hkv, D]`） |
+| `layers/attention/kv_cache/mha.py` | 356 | 全注 | `MHATokenToKVPool` 的显存布局图（每一维的含义，用贯穿例子画出 A、B 的 KV 落在哪些页） |
 | `layers/attention/kv_cache/arena.py`、`factory.py` | 643 / 360 | 头注 | 显存怎么一次性分配、多个 cache group 怎么共享 |
 | `layers/attention/registry.py` | 1604 | 头注 + `create_attn_components` 主线注 | 启动时如何按模型和硬件选出后端和 KV 池 |
 
@@ -202,7 +201,7 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 | --- | --- | --- | --- |
 | `execution/forward_batch_info.py` | 145 | 全注 | `ForwardMode`：EXTEND / DECODE / MIXED / IDLE 的含义；positions 的计算 kernel |
 | `execution/output_layout.py` | 103 | 全注 | 混合批中 prefill 行在前、decode 行在后的布局 |
-| `execution/context.py` | 240 | 全注 | `ForwardContext` 为什么“不存张量”；各字段的生命周期（对照 nano-vllm `Context`） |
+| `execution/context.py` | 240 | 全注 | `ForwardContext` 为什么“不存张量”；各字段的生命周期 |
 | `execution/input_buffer.py` | 799 | 主线注（`fill_input_buffers`、`load_round_inputs`） | 为什么用预分配的固定缓冲区（为 CUDA Graph 做准备）；贯穿例子中 `input_ids_buf` 前 301 个位置分别放什么 |
 | `execution/runtime_states.py` | 619 | 主线注 | 按 request pool slot 存放的长期状态：`future_input_map`（下一轮的输入 token）、停止条件 |
 | `execution/request_slots.py`、`slot_state.py` | 42 / 262 | 头注 | slot 是什么；retraction 时为什么要导出 slot 状态 |
