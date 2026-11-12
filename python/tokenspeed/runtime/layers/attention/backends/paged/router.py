@@ -897,7 +897,7 @@ class CacheGroupRouter(AttentionBackend):
         #      _decode_request_offset=1 让后续读取跳过 A；_append_decode_rows 把 B 的槽位接到 extend 段之后
         #   4. 每个叶子 init_forward_metadata：MHA 叶子据此建 cu_seqlens 等 prefill kernel 需要的元数据
         # 注意：MHA 叶子不把 MIXED 批拆成两次注意力调用，而是把 B 当作 query 长度为 N 的 extend 请求，
-        # 与 A 一起走一次 ragged prefill。MLA 系（FlashMLA，第 9 阶段）会拆成 prefill 半批和 decode 半批分别调用。
+        # 与 A 一起走一次 ragged prefill。MLA 系（FlashMLA，第 12 阶段）会拆成 prefill 半批和 decode 半批分别调用。
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
@@ -1245,7 +1245,7 @@ class CacheGroupRouter(AttentionBackend):
     def query_dtype(self, layer, forward_mode, activation):
         return self._leaf_for(layer).query_dtype(layer, forward_mode, activation)
 
-    # 核心注意力入口。@break_point：breakable CUDA Graph 在这里断开（第 5 阶段），注意力可以在 graph 外 eager 执行。
+    # 核心注意力入口。@break_point：breakable CUDA Graph 在这里断开（第 7 阶段），注意力可以在 graph 外 eager 执行。
     # 注意：save_kv_cache 必须为 False。本层的 K/V 已由 prologue 写进 KV 池，后端只读不写（见 _PREWRITTEN）。
     @break_point
     def forward(

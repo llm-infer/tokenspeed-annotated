@@ -529,7 +529,7 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 - [x] 第 0 阶段：术语表
 - [x] 第 1 阶段：模型骨架
 - [x] 第 2 阶段：基础层零件
-- [ ] 第 3 阶段：注意力与 KV cache 主线
+- [x] 第 3 阶段：注意力与 KV cache 主线
 - [ ] 第 4 阶段：一次前向的组织
 - [ ] 第 5 阶段：logits 与采样
 - [ ] 第 6 阶段：执行面入口与启动
@@ -588,25 +588,25 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 
 | 文件 | 行数 | 等级 |
 | --- | --- | --- |
-| `runtime/layers/attention/backends/base.py` | 902 | S |
+| `runtime/layers/attention/backends/base.py` | 902 | S ✅ |
 | `runtime/layers/attention/backends/cache_metadata.py` | 213 | S ✅ |
-| `runtime/layers/attention/backends/paged/base.py` | 598 | S |
-| `runtime/layers/attention/backends/paged/mha.py` | 806 | S |
+| `runtime/layers/attention/backends/paged/base.py` | 598 | S ✅ |
+| `runtime/layers/attention/backends/paged/mha.py` | 806 | S ✅ |
 | `runtime/layers/attention/backends/paged/router.py` | 1234 | S ✅ |
 | `runtime/layers/attention/backends/paged/write_locations.py` | 320 | S ✅ |
 | `runtime/layers/attention/kv_cache/base.py` | 428 | S ✅ |
 | `runtime/layers/attention/kv_cache/mha.py` | 356 | S ✅ |
-| `runtime/layers/paged_attention.py` | 696 | S |
+| `runtime/layers/paged_attention.py` | 696 | S ✅ |
 | `runtime/engine/scheduler_utils.py` | 1084 | A ✅ |
 | `runtime/layers/attention/backends/paged/group_tables.py` | 566 | A ✅ |
-| `runtime/layers/attention/backends/paged/trtllm.py` | 618 | A |
-| `runtime/layers/attention/chunk.py` | 306 | A |
+| `runtime/layers/attention/backends/paged/trtllm.py` | 618 | A ✅ |
+| `runtime/layers/attention/chunk.py` | 306 | A ✅ |
 | `runtime/layers/attention/configs/base.py` | 394 | A ✅ |
 | `runtime/layers/attention/configs/mha.py` | 108 | A ✅ |
 | `runtime/layers/attention/kv_cache/arena.py` | 643 | A ✅ |
 | `runtime/layers/attention/kv_cache/factory.py` | 360 | A ✅ |
 | `runtime/layers/attention/page_table.py` | 90 | A ✅ |
-| `runtime/layers/attention/registry.py` | 1604 | A |
+| `runtime/layers/attention/registry.py` | 1604 | A ✅ |
 | `runtime/layers/attention/backends/paged/cache_group_geometry.py` | 122 | B ✅ |
 | `runtime/layers/attention/backends/support.py` | 146 | B ✅ |
 | `runtime/layers/attention/kernel_page_sizes.py` | 55 | B ✅ |

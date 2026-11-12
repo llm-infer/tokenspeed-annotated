@@ -18,6 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 注意力组件的“装配厂”：启动时决定用哪个注意力后端、按什么 cache 规划分配 KV 显存，并把两者绑在一起。
+#
+# 你在这里：执行器启动时 execution/device.py 调用 create_attn_components（第 6 阶段），只调用一次
+# （重建 arena 时可复用已有后端）。之后每次前向只用到它产出的 attn_backend 和 token_to_kv_pool。
+#
+# create_attn_components 的步骤（Qwen3-8B 单卡、--attention-backend 不指定）：
+#   1. 解析模型“家族”（_resolve_attn_side）：按 architectures 判断是不是混合线性注意力、Inkling 等特殊模型
+#      Qwen3ForCausalLM -> 普通模型，所有 is_* 都为 False
+#   2. 必要时改写 server_args 中的后端名（_apply_backend_overrides，混合模型强制 hybrid_linear_attn）
+#   3. 构造注意力配置 AttnConfig（_create_attn_config）：MHA 架构 -> MHAConfig.generate（见 configs/mha.py）
+#   4. 选 cache recipe（_resolve_cache_family）：Qwen3 -> "mha"（普通家族）
+#   5. 显存预算：profile_available_cache_memory_bytes 测出可用显存，减去 CUDA Graph 预留（utils.py）
+#   6. recipe 规划 cache 布局（每个 cache group 的 block 大小、能放多少 block，第 14 阶段）
+#   7. create_cache_arena 一次分配整块显存；create_cache_pool 为目标模型（和草稿模型）各建一个层窗口视图
+#   8. 建后端：MHA 架构默认后端名 "mha" -> MHAAttnBackend 是分页叶子 -> 包成 CacheGroupRouter（create_paged_router）
+#   9. backend.set_cache_pool(pool)：router 按 pool 发布的 cache group 建叶子
+#   10. 返回 AttentionBuild（后端、pool、显存报告等）
+#
+# 本文件大部分代码是为了覆盖各种特殊模型（混合线性注意力、DSA、MSA、Inkling、DeepSeek V4.1、草稿模型、PP、KVP）；
+# 主线读者只需看上面这条路径，以及 register_backend / _get_backend_cls / create_paged_router。
 from __future__ import annotations
 
 import dataclasses
@@ -85,6 +105,7 @@ from tokenspeed.runtime.layers.attention.utils import (
 
 logger = logging.getLogger(__name__)
 
+# 普通 cache 家族：没有专用 recipe、由通用（ordinary）recipe 规划的四种注意力。
 _ORDINARY_CACHE_FAMILIES = frozenset({"mha", "mla", "dsa", "msa"})
 
 if TYPE_CHECKING:
@@ -110,8 +131,17 @@ class AttentionBuild:
     Placement stays in the build result rather than on the allocation owner.
     """
 
+    # 译：供设备装配使用的完整注意力资源和 cache 放置信息。
+    #
+    #     字段放置和就绪状态，由选择常驻字段时所用的同一份 cache 归属解析而来。
+    #     PP 收窄物理 arena 时，``logical_plan`` 保留完整的 PD 传输布局；arena 已经持有完整规划时它为 None。
+    #     放置信息保留在构建结果中，而不放在分配的拥有者上。
+
     # Resolved full-attention choices, including hybrid sub-backends. These
     # are startup compatibility facts; they do not expose backend internals.
+    # 译：解析后的全注意力选择，包括混合模型的子后端。这些是启动时的兼容性事实；不暴露后端内部细节。
+    # 主线关心的字段：attn_backend（Qwen3 为 CacheGroupRouter）、token_to_kv_pool（KV 池，见 kv_cache/mha.py）。
+    # draft_* 在开启投机解码时才有值。
     attention_backend_name: str
     draft_attention_backend_name: str
     attn_backend: AttentionBackend
@@ -120,6 +150,7 @@ class AttentionBuild:
     draft_token_to_kv_pool: CachePool | None
     cache_storage: dict
     # The budget the memory profile gave before any CUDA-graph reserve.
+    # 译：做任何 CUDA graph 预留之前，内存 profile 给出的预算。
     profiled_cache_bytes: int
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
     producer_fields_by_step: tuple[tuple[str, ...], ...]
@@ -155,6 +186,11 @@ def _resolve_heterogeneous_draft_family(
     different family is a layout contradiction, not that pattern, and is
     rejected instead of silently bound to the target's pool factory.
     """
+    # 译：校验并返回受支持的异构草稿家族。
+    #
+    #     ``None`` 表示草稿通过目标家族自己的 recipe 绑定——这是每个带有集成草稿视图的自定义家族所依赖的模式
+    #     （它的 recipe 规划草稿层）。PROFILE 声明了不同家族的草稿是布局上的矛盾，而不是这种模式，
+    #     会被拒绝，而不是被悄悄绑定到目标模型的 pool 工厂。
     if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
@@ -185,6 +221,9 @@ def _arena_allocated_bytes(arena) -> int:
     Summing a pool's per-layer view sizes would answer a different question
     (and double-count aliased views), so read the owner directly.
     """
+    # 译：本模型的 cache 拥有者实际占用的设备字节数。
+    #
+    #     对 pool 的逐层视图大小求和回答的是另一个问题（而且会把别名视图重复计算），所以直接读拥有者。
     return int(arena.allocated_device_bytes)
 
 
@@ -195,12 +234,14 @@ def _cache_storage_report(
     fixed_workspace_bytes: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
+    # 译：根据已分配的张量（而不是调度器的计数）描述 cache 存储。
     arena = pool.arena
     plan = arena.plan
     packing = {
         group.group_id: int(group.cache_blocks_per_lcm_block) for group in plan.groups
     }
     # The arena is the one definition of child-token capacity.
+    # 译：arena 是子 token 容量的唯一定义。
     physical_token_capacity = int(arena.size)
     geometry = {
         "prefix_granularity": int(plan.prefix_granularity),
@@ -209,6 +250,7 @@ def _cache_storage_report(
         # Fraction of a parent each group's binding actually uses;
         # aliased slabs are sized by their widest tenant, so a narrow
         # binding strands the rest.
+        # 译：每个组的绑定实际用到父块的比例；别名的 slab 按其最宽的租户确定大小，所以窄的绑定会浪费剩下的部分。
         "binding_utilization": {
             group_id: round(entry["binding_utilization"], 4)
             for group_id, entry in plan.capacity_report().items()
@@ -217,6 +259,7 @@ def _cache_storage_report(
 
     # One arena: the draft view shares this allocation, so it already covers
     # both models' layers.
+    # 译：只有一个 arena：草稿视图共享这次分配，所以它已经覆盖了两个模型的层。
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
     storage = arena.storage_plan
@@ -244,8 +287,14 @@ def _cache_storage_report(
 
 
 # ---------- backend registry ----------
+# 译：后端注册表
 
 # Maps backend_name -> (supported archs, backend class)
+# 译：映射 backend_name -> (支持的架构, 后端类)
+# 各后端模块在导入时调用 register_backend 把自己登记进来，例如 paged/mha.py 末尾：
+#   register_backend("mha" / "fa3" / "fa4" / "triton" / "flashinfer", {MHA}, MHAAttnBackend)
+# paged/trtllm.py 末尾：register_backend("trtllm", {MHA}, TRTLLMMHAAttnBackend)。
+# --attention-backend 的取值就是这里的键。
 _BACKEND_REGISTRY: dict[str, tuple[set[AttentionArch], type[AttentionBackend]]] = {}
 
 
@@ -259,6 +308,7 @@ def register_backend(
 
 # The composite name the hybrid linear-attention wrapper runs under; it
 # selects the wrapper, never a registered leaf.
+# 译：混合线性注意力包装器运行时使用的复合名称；它选择的是包装器，而不是某个已注册的叶子。
 HYBRID_LINEAR_ATTN_BACKEND = "hybrid_linear_attn"
 
 
@@ -268,6 +318,9 @@ def validate_attention_backend_name(name: str | None, *, flag: str) -> None:
     Runs after plugin discovery, so plugin backends are accepted exactly like
     in-tree ones.
     """
+    # 译：拒绝没有任何树内或插件后端注册过的启动后端名。
+    #
+    #     在插件发现之后运行，所以插件后端与树内后端被同等接受。
     if name is None or name == HYBRID_LINEAR_ATTN_BACKEND:
         return
     if name not in _BACKEND_REGISTRY:
@@ -277,6 +330,7 @@ def validate_attention_backend_name(name: str | None, *, flag: str) -> None:
         )
 
 
+# 以下架构名集合用于识别特殊模型家族（第 13 阶段混合模型等），Qwen3 不在其中。
 _HYBRID_GDN_ARCHITECTURES = {
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3_5MoeForConditionalGenerationNextN",
@@ -289,6 +343,7 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen4ExpForCausalLMNextN",
 }
 # Hybrid models whose linear layers are Mamba2 (SSD) and full-attention layers MHA.
+# 译：线性层为 Mamba2（SSD）、全注意力层为 MHA 的混合模型。
 _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
@@ -301,10 +356,14 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
 # They share the same HybridLinearAttnBackend wrapper and cache-group pool;
 # the base sub-backend auto-resolves to MLA from the arch, and the linear
 # sub-backend runs the KDA kernels (KdaAttnBackend).
+# 译：混合线性注意力模型，其全注意力层是 MLA（不是 MHA），线性层是 KDA（逐通道门控 delta 规则），不是 GDN。
+#     它们共用同一个 HybridLinearAttnBackend 包装器和 cache group pool；基础子后端根据架构自动解析为 MLA，
+#     线性子后端运行 KDA kernel（KdaAttnBackend）。
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
 # Kimi-K3.1: the K3 layout with DSA sparse MLA on its full-attention layers.
+# 译：Kimi-K3.1：K3 的布局，全注意力层使用 DSA 稀疏 MLA。
 _HYBRID_KIMI_DSA_KDA_ARCHITECTURES = {
     "KimiK31ForConditionalGeneration",
 }
@@ -317,6 +376,7 @@ _HYBRID_DSA_KDA_ARCHITECTURES = {
 }
 
 # Inkling stays on the MHA path plus its thin sconv wrapper; it is not hybrid-GDN.
+# 译：Inkling 留在 MHA 路径上，外加它那层很薄的 sconv 包装；它不是混合 GDN。
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
@@ -334,6 +394,11 @@ class _AttnSideProfile:
     derivation instead of two interleaved copies.
     """
 
+    # 译：由架构推导出的、某一侧（目标或草稿）的家族事实。
+    #
+    #     这里的一切都在任何注意力配置存在之前从模型的 ``hf_config`` 解析出来，所以目标侧和草稿侧共用一次推导，
+    #     而不是两份交织的副本。
+
     architectures: tuple[str, ...]
     requested_backend: str | None
     is_hybrid_gdn: bool
@@ -342,8 +407,10 @@ class _AttnSideProfile:
     # KDA hybrid whose full-attention layers are DSA (GLM-5.3-Flash); a
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
+    # 译：全注意力层为 DSA 的 KDA 混合模型（GLM-5.3-Flash）；是 ``is_kda`` 的子集，选择 DSA 历史消费者和 glm53_flash cache 家族。
     is_dsa_kda: bool
     # Kimi-K3.1: subset of is_kda that selects only the DSA history consumer.
+    # 译：Kimi-K3.1：is_kda 的子集，只选择 DSA 历史消费者。
     is_kimi_dsa_kda: bool
     is_qwen4_exp: bool
     is_qsa: bool
@@ -351,12 +418,14 @@ class _AttnSideProfile:
     is_dspark: bool
     # The model's own profile, when it declares one; the facts above are then
     # all False and the profile answers for the model.
+    # 译：模型自己的 profile（若它声明了一个）；此时上面的事实全为 False，由 profile 替模型回答。
     model_profile: ModelProfile | None
 
     @property
     def linear_attention(self) -> str | None:
         """The registered linear-attention backend of the model's linear
         layers, or None for a model without them."""
+        # 译：模型线性层所用的已注册线性注意力后端；没有线性层的模型返回 None。
         if self.model_profile is not None:
             return self.model_profile.linear_attention
         if self.is_kda:
@@ -372,6 +441,8 @@ class _AttnSideProfile:
         # GDN and KDA both take the hybrid-linear path; they differ only in
         # the linear kernel (GDN scalar decay vs KDA per-channel) and the
         # base attn arch (MHA vs MLA vs DSA).
+        # 译：GDN 和 KDA 都走混合线性路径；它们只在线性 kernel（GDN 标量衰减 vs KDA 逐通道）和
+        #     基础注意力架构（MHA vs MLA vs DSA）上不同。
         return self.linear_attention is not None
 
 
@@ -428,6 +499,7 @@ def _check_pd_support(
     has_draft_model: bool,
 ) -> None:
     """Every disaggregated-serving support gate, raised up front."""
+    # 译：所有分离式服务（PD 分离）的支持性检查，提前报错。
     if server_args.disaggregation_mode not in ("prefill", "decode"):
         return
     if (target.is_inkling or (draft is not None and draft.is_inkling)) and (
@@ -451,6 +523,10 @@ def _apply_backend_overrides(
     ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
+    # 译：家族解析写回 ``server_args`` 的唯一地方。
+    #
+    #     这个修改是有意为之，不是捷径：``_create_attn_config`` 通过 generate() 协议读取后端选择。必须在任何
+    #     ``_create_attn_config`` 调用之前运行。用户在覆盖之前的选择保存在 ``profile.requested_backend`` 中。
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
 
@@ -458,6 +534,8 @@ def _apply_backend_overrides(
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
         # hybrid_linear_attn. The user's original choice stays in the profile
         # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
+        # 译：GDN（Qwen3.5）/ KDA（Kimi-K3）混合模型总是需要 hybrid_linear_attn。用户原来的选择保存在 profile 中，
+        #     供全注意力子后端使用（GDN 用 MHA，KDA 用 MLA）。
         server_args.attention_backend = HYBRID_LINEAR_ATTN_BACKEND
         if (
             draft is not None
@@ -470,6 +548,8 @@ def _apply_backend_overrides(
             # A K3 continuation must resolve its history consumer before
             # AttnConfig validates its DCP decode. Inherit the target's resolved leaf,
             # while preserving an explicitly requested draft leaf.
+            # 译：K3 的延续层（continuation）必须在 AttnConfig 校验其 DCP decode 之前解析出历史消费者。继承目标模型
+            #     已解析的叶子，同时保留显式请求的草稿叶子。
             server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
                 target.requested_backend,
                 is_kda=True,
@@ -495,10 +575,12 @@ def _resolve_full_attn_backend_name(
 ) -> str:
     """The name the full-attention layers run on (the hybrid sub-backend,
     or the config's own resolution)."""
+    # 译：全注意力层运行所用的名字（混合模型的子后端，或配置自己的解析结果）。
     if profile.is_hybrid_linear:
         if profile.model_profile is not None:
             # The launch choice, already defaulted from the profile; None
             # selects the architecture's default leaf.
+            # 译：启动时的选择，已经按 profile 给了默认值；None 选择该架构的默认叶子。
             return (
                 None if hybrid_request == HYBRID_LINEAR_ATTN_BACKEND else hybrid_request
             )
@@ -521,6 +603,9 @@ def _cache_backend_name(
     This is startup compatibility metadata only. MSA still constructs its
     dense/sparse routers from the original config, on the common path.
     """
+    # 译：标识 cache 的生产者，包括 MSA 的稠密子后端。
+    #
+    #     这只是启动时的兼容性元数据。MSA 仍在公共路径上，从原始配置构造它的稠密 / 稀疏 router。
     name = full_attn_backend_name or _get_default_backend_name(arch)
     if isinstance(softmax_attn, MSAConfig):
         dense_name = softmax_attn.full_attn_backend_name or "mha"
@@ -530,6 +615,7 @@ def _cache_backend_name(
 
 def _has_state_layers(config: AttnConfig) -> bool:
     """The plan actually carries recurrent state (hybrid arch + state labels)."""
+    # 译：规划中确实带有循环状态（混合架构 + 状态标签）。
     if config.component(LinearAttnConfig) is None:
         return False
     return any(
@@ -543,6 +629,7 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
+    # 译：从家族事实（加上已构建的配置）到 recipe 的唯一分派。
     if profile.model_profile is not None and profile.model_profile.cache_family:
         return profile.model_profile.cache_family
     if config.component(Dots3NoteAttentionConfig) is not None:
@@ -550,6 +637,7 @@ def _resolve_cache_family(
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     # PLE and QSA are cache consumers even in a view without GDN layers.
+    # 译：即使在没有 GDN 层的视图中，PLE 和 QSA 也是 cache 消费者。
     if profile.is_qwen4_exp:
         return "qwen4_exp"
     if profile.is_hybrid_gdn and _has_state_layers(config):
@@ -571,6 +659,7 @@ def _resolve_cache_family(
     return family
 
 
+# 后端名为 None（用户未指定）时按注意力架构取默认后端名。Qwen3 是 MHA 架构 -> "mha" -> MHAAttnBackend。
 def _get_default_backend_name(arch: AttentionArch) -> str:
     if arch == AttentionArch.MLA:
         return "mla"
@@ -618,6 +707,11 @@ def create_paged_router(
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
     """
+    # 译：为某一侧的分页注意力构建 CacheGroupRouter。
+    #
+    #     router 为之后通过 ``set_cache_pool`` 绑定的 pool 视图中的每个分页（历史）cache group 构建一个
+    #     ``PagedAttentionBackend`` 叶子；每个叶子的 kernel 页大小依次取自配置覆盖、叶子类默认值或组自己的 block 粒度
+    #     （``PagedAttentionBackend.resolve_kernel_page_size``）。
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
@@ -636,9 +730,13 @@ def create_paged_router(
         # The composite sentinel _apply_backend_overrides writes into
         # server_args (and MHAConfig.generate copies into the spec). It
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
+        # 译：这是 _apply_backend_overrides 写进 server_args 的复合哨兵值（MHAConfig.generate 会把它拷进 spec）。
+        #     它命名的是“包装器”；包装器下面的叶子根据架构自动解析。
         name = None
     leaf_cls = _get_backend_cls(name, arch)
 
+    # leaf_factory 此时只是定义，router 在 set_cache_pool 时才为每个 cache group 调用它（延迟构造）。
+    # 例：Qwen3 一个 group，block 粒度 64 -> MHA 叶子 kernel 页大小 64；trtllm 叶子则固定为 64。
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id
         kernel_page_size = leaf_cls.resolve_kernel_page_size(config, block_granularity)
@@ -646,6 +744,8 @@ def create_paged_router(
         # construction happens lazily at set_cache_pool, and several leaves
         # interpret backend_name themselves (MHA/MLA kernel-solution maps),
         # so a wrapper-selecting name like 'dsa' must not reach them.
+        # 译：用一个全新的 spec，绝不对共享组件做“修改后再恢复”：叶子构造在 set_cache_pool 时才延迟发生，而且有几个叶子
+        #     会自己解释 backend_name（MHA/MLA 的 kernel 实现映射），所以像 'dsa' 这种选择包装器的名字不能传到它们那里。
         leaf_spec = dataclasses.replace(spec, backend_name=name)
         return leaf_cls(config, leaf_spec, kernel_page_size=kernel_page_size)
 
@@ -673,6 +773,13 @@ def _pin_fixed_kernel_page(
     block span and pins nothing; MSA builds a dense and a sparse leaf, and its
     recipe adds the sparse page itself.
     """
+    # 译：在普通侧的配置上固定一个“固定页大小叶子”的 kernel 页。
+    #
+    #     普通 recipe 让一个 block 跨越其前缀粒度，并把这个跨度定为能容纳整数个 kernel 页（``OrdinaryRecipe.prefix_granularity``），
+    #     所以叶子固定的页大小必须在规划之前可见。随后叶子从固定的值解析出同样的页大小。页大小灵活的叶子以 block 跨度运行，
+    #     不固定任何东西；MSA 构建一个稠密叶子和一个稀疏叶子，其 recipe 自己加上稀疏的页大小。
+    # 例：--attention-backend trtllm -> 叶子类默认页 64 -> 把 config.kernel_page_size 设为 64，
+    # recipe 据此保证 block 粒度是 64 的整数倍。默认的 mha 后端 default_kernel_page_size=None，不做任何事。
     from tokenspeed.runtime.layers.attention.backends.paged.base import (
         PagedAttentionBackend,
     )
@@ -702,6 +809,9 @@ def _validate_lcm_page_size(
     An unset kernel_page_size means the backend resolves its registry
     default itself and owns the divisibility check for it.
     """
+    # 译：要求调度器页包含整数个配置的 kernel 页。
+    #
+    #     未设置 kernel_page_size 表示后端自己解析其 registry 默认值，并自己负责整除检查。
     if config.kernel_page_size is None:
         return
     kernel_page_size = int(config.kernel_page_size)
@@ -717,6 +827,7 @@ def _validate_lcm_page_size(
 
 
 # ---------- arch -> config class ----------
+# 译：架构 -> 配置类
 
 _CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
     AttentionArch.MHA: MHAConfig,
@@ -728,6 +839,8 @@ _CONFIG_CLS: dict[AttentionArch, type[SoftmaxAttnConfig]] = {
 # Architectures declaring a linear-attention component, registered like
 # _CONFIG_CLS. Whether a given checkpoint actually has linear layers is
 # decided by generate() (NextN drafts may carry none).
+# 译：声明了线性注意力组件的架构，像 _CONFIG_CLS 一样注册。某个 checkpoint 是否真的有线性层由 generate() 决定
+#     （NextN 草稿可能一层都没有）。
 _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
     arch: LinearAttnConfig
     for arch in (
@@ -736,6 +849,7 @@ _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
         *_HYBRID_KIMI_DSA_KDA_ARCHITECTURES,
         # GLM NextN is one DSA layer. It reuses the target's mixed-layer
         # metadata but must not acquire a linear-attention component.
+        # 译：GLM 的 NextN 是一个 DSA 层。它复用目标模型的混合层元数据，但不能获得线性注意力组件。
         *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
     )
 } | {arch: Mamba2Config for arch in _HYBRID_MAMBA2_ARCHITECTURES}
@@ -744,6 +858,8 @@ _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
 def _create_attn_config(
     server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
 ) -> AttnConfig:
+    # 例：Qwen3-8B 无 model_profile、不是 Dots3 / DeepSeek V4.1 -> MHAConfig.generate(...)，
+    # 得到只含一个 MHAConfig 组件的 AttnConfig（字段见 configs/base.py、configs/mha.py）；没有线性注意力组件。
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
@@ -775,6 +891,7 @@ def _create_attn_config(
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
+    # 译：额外的组件通过同样的 generate() 协议构建，并组合进 config.components（消费者通过 ``component()`` 按类查找）。
     linear_attn = _linear_attn_component(server_args, model_config, is_draft)
     if linear_attn is not None:
         config = dataclasses.replace(
@@ -794,6 +911,11 @@ def _linear_attn_component(
     config must expose ``linear_layer_ids`` and the geometry fields
     ``LinearAttnConfig.generate`` reads.
     """
+    # 译：线性注意力组件；没有线性注意力的模型返回 None。
+    #
+    #     声明了 ``linear_attention`` 的插件 profile 必须得到它：只用全注意力来服务这个模型会悄悄出错。
+    #     目前树内的 schema 是唯一的线性配置读取者，所以 checkpoint 配置必须暴露 ``linear_layer_ids`` 以及
+    #     ``LinearAttnConfig.generate`` 读取的几何字段。
     if model_config.model_profile is not None:
         profile_linear = model_config.model_profile.linear_attention
         if profile_linear is None:
@@ -835,10 +957,13 @@ def _create_attn_backend_with_name(
         PagedAttentionBackend,
     )
 
+    # 关键分支：注册的后端类若是分页叶子（PagedAttentionBackend 子类，如 MHA / trtllm），runner 拿到的不是叶子本身，
+    # 而是包着叶子的 CacheGroupRouter；其他（非分页的复合后端）直接构造。
     cls = _get_backend_cls(name, arch)
     if issubclass(cls, PagedAttentionBackend):
         # Paged leaves are served through the cache-group router: one leaf
         # per history group, blocks -> kernel pages mapped in one place.
+        # 译：分页叶子通过 cache group router 提供服务：每个历史组一个叶子，block -> kernel 页只在一个地方映射。
         return create_paged_router(config, arch, backend_name=name)
     spec = dataclasses.replace(
         config.component(SoftmaxAttnConfig),
@@ -855,6 +980,7 @@ def _resolve_hybrid_full_backend_name(
     is_qsa: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
+    # 译：解析消费混合历史 cache 的计算后端。
     name = None if requested_name == HYBRID_LINEAR_ATTN_BACKEND else requested_name
     if is_qsa:
         if name is not None:
@@ -867,11 +993,13 @@ def _resolve_hybrid_full_backend_name(
         return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
+    # 译：NVIDIA 上的 K3 默认使用其 CuteDSL 历史消费者。AMD 保留通用的 MLA 后端；用户的显式选择始终优先。
     if is_kda and name is None and not current_platform().is_amd:
         return "tokenspeed_mla"
     return name
 
 
+# 以下到 _create_hybrid_linear_attn_backend 为混合线性注意力模型专用（第 13 阶段），初读可跳过。
 def _kda_linear_attn_backend(
     server_args: ServerArgs, config: AttnConfig
 ) -> AttentionBackend:
@@ -918,6 +1046,8 @@ def _mamba2_linear_attn_backend(
 # Linear-attention backends by name: ``factory(server_args, config)`` builds
 # the backend a hybrid model's linear layers run on. Plugins add entries via
 # ``tokenspeed.runtime.plugins.registry.register_linear_attention_backend``.
+# 译：按名字索引的线性注意力后端：``factory(server_args, config)`` 构建混合模型线性层运行所用的后端。
+#     插件通过 ``tokenspeed.runtime.plugins.registry.register_linear_attention_backend`` 添加条目。
 _LINEAR_ATTN_BACKENDS: dict[
     str, Callable[[ServerArgs, AttnConfig], AttentionBackend]
 ] = {
@@ -944,6 +1074,11 @@ def _create_hybrid_linear_attn_backend(
     pool through the wrapper's ``set_cache_pool``. ``pool`` is inspected here
     only to select the consumers local to this model view.
     """
+    # 译：为线性注意力模型创建混合后端。
+    #
+    #     ``linear_attention`` 命名线性层的已注册后端：``gdn``（Qwen3.5，MHA 基础）、``kda``（Kimi-K3，MLA 基础；
+    #     GLM-5.3-Flash，DSA 基础）或某个插件的。两个子后端都通过包装器的 ``set_cache_pool`` 绑定到同一个共享 cache pool。
+    #     这里检查 ``pool`` 只是为了选出本模型视图本地的消费者。
     from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
     )
@@ -959,6 +1094,7 @@ def _create_hybrid_linear_attn_backend(
     full_attn_layers = text_config.full_attention_layer_ids
     # The paged full-attention router (MHA, MLA or DSA leaves by arch): the
     # user's original choice if provided, otherwise auto-selected.
+    # 译：分页的全注意力 router（按架构为 MHA、MLA 或 DSA 叶子）：若用户提供了原始选择就用它，否则自动选择。
     full_attn_backend = _create_attn_backend_with_name(
         full_attn_backend_name,
         model_config.attention_arch,
@@ -970,6 +1106,9 @@ def _create_hybrid_linear_attn_backend(
     # MHAConfig.generate. Otherwise the AttnConfig sentinel (1) wins so
     # non-spec hybrid decode doesn't get misclassified as target verify /
     # draft extend by `self.spec_num_tokens > 1`.
+    # 译：创建 mamba / 线性注意力后端。只有真正开启投机解码时才传递配置的验证宽度——与 MLAConfig / MHAConfig.generate 一致。
+    #     否则 AttnConfig 的哨兵值（1）生效，这样非投机的混合 decode 不会因为 `self.spec_num_tokens > 1`
+    #     被误判为目标验证 / 草稿 extend。
     if server_args.speculative_algorithm is not None:
         if server_args.disaggregation_mode == "prefill":
             # The prefill role only executes committed prefill state. A KDA
@@ -977,6 +1116,8 @@ def _create_hybrid_linear_attn_backend(
             # explicit workspace preparation, so its verify width must already
             # be one. Keep the original target/draft configs intact for
             # logical cache geometry and other backend views.
+            # 译：prefill 角色只执行已提交的 prefill 状态。KDA 后端在 set_kv_pool 中、在显式准备工作区之前就开始分配重放负载，
+            #     所以它的验证宽度必须已经是 1。保持原始的目标 / 草稿配置不变，供逻辑 cache 几何和其他后端视图使用。
             config = dataclasses.replace(config, speculative_num_draft_tokens=1)
         else:
             config.speculative_num_draft_tokens = (
@@ -988,6 +1129,8 @@ def _create_hybrid_linear_attn_backend(
     # (e.g. MTP on Qwen3.5) shares the same architecture class as the
     # target but commonly ships with *zero* mamba layers; such a view has no
     # state groups to consume, so the router alone serves it.
+    # 译：线性组件是否存在决定本模型是否真的有线性 / mamba 层。混合 GDN 目标模型上的草稿模型（例如 Qwen3.5 上的 MTP）
+    #     与目标模型共用同一个架构类，但通常一个 mamba 层都没有；这样的视图没有可消费的状态组，所以只由 router 服务。
     linear_attn = config.component(LinearAttnConfig)
 
     if linear_attn is None or not pool.state_group_by_layer:
@@ -1034,8 +1177,12 @@ def _create_target_components(
     ``backend`` reuses an existing one, for a caller that is building a
     replacement arena for backends it already owns.
     """
+    # 译：目标模型在共享 arena 上的计算视图 + 目标后端。
+    #
+    #     ``backend`` 复用一个已有的后端，供那些为自己已拥有的后端构建替换 arena 的调用方使用。
     # The arena owns every planned field; this view binds only the target
     # model's layer window.
+    # 译：arena 拥有每个规划的字段；这个视图只绑定目标模型的层窗口。
     pool = create_cache_pool(
         cache_spec,
         config,
@@ -1056,6 +1203,7 @@ def _create_target_components(
         )
         return backend, pool
 
+    # 普通模型（Qwen3）走这里：_create_attn_backend -> _create_attn_backend_with_name -> create_paged_router。
     backend = _create_attn_backend(model_config.attention_arch, config)
     if not is_inkling:
         return backend, pool
@@ -1102,6 +1250,13 @@ def _create_draft_components(
     way through -- the view *is* the mapping, and an id outside the window is
     rejected rather than silently offset onto another model's planes.
     """
+    # 译：草稿后端 + 通过草稿层窗口来看的“唯一一个” arena。
+    #
+    #     一个大模型，一个 arena：草稿层是合并规划中的延续层，所以草稿 pool 是第二个计算视图，它的 ``field_layer_offset``
+    #     把它的“本地”层 id（NextN 草稿的那一层是第 0 层）放到延续范围上。一路上没有任何地方重映射 id——视图“就是”映射，
+    #     窗口之外的 id 会被拒绝，而不是被悄悄偏移到另一个模型的平面上。
+    # 例：Qwen3-8B（36 层）+ 1 层的 NextN 草稿：合并规划共 37 层，草稿视图 field_layer_offset=36，
+    # 草稿的第 0 层对应 arena 中的第 36 层字段。
     if config is None:
         return None, None
     if is_heterogeneous and (linear_attention is not None or is_inkling):
@@ -1111,6 +1266,7 @@ def _create_draft_components(
     num_layers = model_config.num_attention_layers
     # The draft view's transfer counter stays local/None; heterogeneous PD is
     # rejected before construction.
+    # 译：草稿视图的传输计数器保持本地 / None；异构 PD 在构造之前就被拒绝。
     draft_pool = create_cache_pool(
         cache_spec,
         config,
@@ -1141,6 +1297,7 @@ def _create_draft_components(
         # Depth layers carry conv checkpoint fields as continuation tenants
         # of the target's kvconv/hiddenconv groups; the draft gets the same
         # paged bridges (publish/restore) the target wrapper gets.
+        # 译：深度层把卷积检查点字段作为目标模型 kvconv/hiddenconv 组的延续租户携带；草稿得到与目标包装器相同的分页桥接（发布 / 恢复）。
         text_config = model_config.hf_config.get_text_config()
         backend = InklingAttnBackend.from_config(
             backend,
@@ -1174,6 +1331,12 @@ def _prepare_fixed_workspaces(
     buffers (the draft's extend step follows the target's forward on the
     same stream), so the plan budgets one workspace.
     """
+    # 译：分配 recipe 从 cache 预算中预留的固定工作区（``CacheRecipe.workspace_bytes``），并检查字节数一致。
+    #
+    #     包括分页状态家族的验证工作区、Qwen4-Exp 的 QSA BF16 prefill 暂存区（``qsa_bf16_scratch``，目标模型的）以及
+    #     GPU DSA 的 query-context 并行历史收集工作区：目标树分配后者一次，草稿树收集到同样的缓冲区中（草稿的 extend 步
+    #     在同一个流上紧跟目标模型的前向），所以规划只为一个工作区做预算。
+    # Qwen3（普通 MHA、无 QCP）在这里什么都不分配，直接返回。
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
         qwen4_exp_backend,
@@ -1199,6 +1362,7 @@ def _prepare_fixed_workspaces(
         allocated = True
     # V4.1 allocates its gathered projections and per-request packed history
     # per forward; it has no DSA history gather workspace to reserve.
+    # 译：V4.1 每次前向分配它收集的投影和逐请求打包的历史；它没有需要预留的 DSA 历史收集工作区。
     if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
@@ -1220,6 +1384,7 @@ def _prepare_fixed_workspaces(
 
 
 # ---------- public API ----------
+# 译：公共 API
 def _narrow_spec_for_pp(
     spec: CachePoolSpec, ownership: CacheLayerOwnership
 ) -> CachePoolSpec:
@@ -1228,6 +1393,8 @@ def _narrow_spec_for_pp(
     full model's so every rank's scheduler plans identically. The caller
     retains the complete plan separately for the PD wire contract.
     """
+    # 译：分块流水线阶段：只为本阶段各层的平面做物理分配。逻辑几何（父块、打包方式、页计算）保持为完整模型的，
+    #     这样每个 rank 的调度器规划都一致。调用方另外保留完整规划，用于 PD 传输契约。
     stage_start, stage_end = ownership.resident_cache_window
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
         plan_cache_storage,
@@ -1256,6 +1423,7 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
 
 def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
     """Validate declared storage, independent of recipe name or inheritance."""
+    # 译：校验声明的存储，与 recipe 名字或继承关系无关。
     groups = spec.cache_group_specs
     if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
@@ -1292,8 +1460,10 @@ def create_attn_components(
     reuse_draft_backend: AttentionBackend | None,
 ) -> AttentionBuild:
     """Build attention resources and return their explicit cache placement."""
+    # 译：构建注意力资源，并返回它们显式的 cache 放置信息。
     if probe_batch_rows is not None and graph_reserve_bytes:
         # An arena sized by block count ignores the budget, so it cannot honour one.
+        # 译：按 block 数确定大小的 arena 会忽略预算，所以无法满足预算约束。
         raise ValueError(
             f"a probe arena of {probe_batch_rows} blocks cannot also "
             f"reserve {graph_reserve_bytes} bytes: the two size the pool by "
@@ -1316,6 +1486,8 @@ def create_attn_components(
     )
     _apply_backend_overrides(server_args, target, draft)
 
+    # 步骤 3、4：构造 AttnConfig，选 cache recipe 家族，并确定全注意力层用的后端名
+    # （Qwen3 未指定时为 None，之后按架构取默认 "mha"）。
     config = _create_attn_config(server_args, model_config)
     softmax_attn = config.component(SoftmaxAttnConfig)
     cache_family = _resolve_cache_family(target, config)
@@ -1325,6 +1497,7 @@ def create_attn_components(
     if (
         config.kvp_size > 1
         # V4.1 validates KVP in its config and specialized recipe.
+        # 译：V4.1 在自己的配置和专用 recipe 中校验 KVP。
         and softmax_attn.backend_name != "deepseek_v41"
         and (
             model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
@@ -1358,6 +1531,7 @@ def create_attn_components(
     draft_full_attn_backend_name = (
         # The draft's hybrid sub-backend request is its config's own
         # resolution, not the user's target choice.
+        # 译：草稿的混合子后端请求是它自己配置的解析结果，而不是用户对目标模型的选择。
         _resolve_full_attn_backend_name(
             draft, draft_softmax_attn, hybrid_request=draft_softmax_attn.backend_name
         )
@@ -1368,6 +1542,8 @@ def create_attn_components(
     # leaves cache_family None declares nothing: it binds like an undeclared
     # draft, so the same draft serves an ordinary target (as an MHA view) and a
     # custom family (through that family's own recipe).
+    # 译：草稿模型自己的 profile 对其 cache 布局有决定权。cache_family 为 None 的 profile 什么都不声明：它像未声明的草稿一样绑定，
+    #     所以同一个草稿既可以服务普通目标模型（作为 MHA 视图），也可以服务自定义家族（通过该家族自己的 recipe）。
     draft_profile = (
         draft_model_config.model_profile if draft_attn_config is not None else None
     )
@@ -1384,6 +1560,9 @@ def create_attn_components(
         draft_family_declared=draft_family_declared,
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
+    # 译：每次启动 profile 一次，由不带预留的那次启动来做；重建时复用它。
+    # 步骤 5：显存预算。profile_available_cache_memory_bytes 测出加载权重后还能给 KV cache 用的字节数，
+    # reserve_cache_budget 再扣掉 CUDA Graph 预留（见 utils.py）。
     if profiled_cache_bytes is None:
         profiled_cache_bytes = profile_available_cache_memory_bytes(
             attn_config=config,
@@ -1403,6 +1582,8 @@ def create_attn_components(
             draft_attn_config = _pin_fixed_kernel_page(
                 draft_attn_config, draft_model_config, draft_full_attn_backend_name
             )
+    # 步骤 6：recipe 规划 cache 布局。Qwen3 走普通 MHA recipe：一个 full_history 组，
+    # 每 token 每层 4096 字节（8 头 × 128 × 2（K、V）× 2 字节），36 层共 144 KiB / token。
     recipe = cache_recipe(
         cache_family,
         server_args=server_args,
@@ -1417,6 +1598,7 @@ def create_attn_components(
     )
     # Reserved from the budget by the recipe, allocated below; a family
     # without QSA layers refuses --enable-qsa-prefill-bf16-scratch here.
+    # 译：由 recipe 从预算中预留、在下面分配；没有 QSA 层的家族在这里拒绝 --enable-qsa-prefill-bf16-scratch。
     qsa_bf16_scratch = recipe.qsa_bf16_scratch_plan
     num_draft_cache_layers = recipe.num_draft_layers
     num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
@@ -1463,6 +1645,7 @@ def create_attn_components(
     if num_draft_cache_layers:
         # Transfer fields need one owner even when target and draft share a
         # cache family, so both compute views use disjoint layer windows.
+        # 译：传输字段即使在目标与草稿共享一个 cache 家族时也需要唯一的拥有者，所以两个计算视图使用不相交的层窗口。
         target_spec = spec.layer_view(
             first_layer=0,
             num_layers=num_target_cache_layers,
@@ -1485,6 +1668,7 @@ def create_attn_components(
     cache_budget_bytes = cache_setup.cache_budget_bytes
     fixed_workspace_bytes = cache_setup.fixed_workspace_bytes
     # A probe arena is not the served geometry; it must not read as one.
+    # 译：探测用的 arena 不是实际服务的几何，不能被当成实际几何（日志级别降为 DEBUG）。
     logger.log(
         logging.DEBUG if probe_batch_rows is not None else logging.INFO,
         f"Cache profile: parent_bytes={spec.memory_plan.lcm_block_bytes:d}, P="
@@ -1497,6 +1681,7 @@ def create_attn_components(
 
     # One model, one arena: the merged plan's single allocation, which every
     # compute view below (target, draft) is a layer window onto.
+    # 译：一个模型，一个 arena：合并规划的单次分配，下面的每个计算视图（目标、草稿）都是它上面的一个层窗口。
     logical_plan = None
     if server_args.mapping.has_pp:
         logical_plan = spec.memory_plan
@@ -1518,6 +1703,7 @@ def create_attn_components(
         f"fixed_workspace_bytes={fixed_workspace_bytes}, "
         f"budget_bytes={cache_budget_bytes}",
     )
+    # 步骤 7、8：一次分配 arena，再为目标模型（和草稿模型）建 pool 视图与后端。
     arena = create_cache_arena(
         spec,
         device=config.device,
@@ -1557,6 +1743,8 @@ def create_attn_components(
     # their group geometry (and buffer sizing) from the pool's published
     # specs. Every LCM pool publishes a cache contract, so there is no
     # separate contract-marking step.
+    # 译：在分配 CUDA graph 状态之前绑定 pool：后端从 pool 发布的规格中得知其组几何（以及缓冲区尺寸）。
+    #     每个 LCM pool 都发布 cache 契约，所以没有单独的契约标记步骤。
     for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
         if side_backend is None or side_pool is None:
             continue
