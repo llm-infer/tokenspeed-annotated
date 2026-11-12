@@ -80,6 +80,54 @@ from tokenspeed.runtime.layers.quantization import QuantizationConfig as Q
 #   ⑤ o_proj 的部分和在这里 all-reduce，条件允许时与相加、norm 融合成一个 kernel
 #   ⑧ down_proj 的部分和在这里 all-reduce；条件允许时跳过，推迟到下一层的 ① 融合进去
 #   ③ ⑥ 在 RSAG 布局下（层输出 reduce-scatter、各 rank 只持有部分行）负责 all-gather 回完整行
+#
+# 图示一：all-reduce 布局（注意力 TP = MLP TP = 2，2 张卡，T=301）
+#   两个 rank 都持有全部 301 行，只是各算一半的头 / 一半的 intermediate。
+#
+#             rank 0                                     rank 1
+#   (hidden 部分和 [301,4096], residual [301,4096])   （同左）
+#        │ ① all-reduce(hidden) + residual，再 input_layernorm   ← 条件允许时三步融合成一个 kernel
+#        │    ◄════════════════ all-reduce ════════════════►
+#        ▼                                                  ▼
+#   ④ 注意力：q 头 0~15、KV 头 0~3                  ④ 注意力：q 头 16~31、KV 头 4~7
+#      o_proj 输出部分和 [301,4096]                    o_proj 输出部分和 [301,4096]
+#        │ ⑤ all-reduce + 相加残差 + post_attention_layernorm（条件允许时融合）
+#        │    ◄════════════════ all-reduce ════════════════►
+#        ▼                                                  ▼
+#   ⑦ MLP：intermediate 的前一半（6144）           ⑦ MLP：intermediate 的后一半（6144）
+#      down_proj 输出部分和 [301,4096]                 down_proj 输出部分和 [301,4096]
+#        │ ⑧ 融合时：什么也不做，带着部分和进入下一层的 ①
+#        │   不融合时：在这里 all-reduce
+#        ▼                                                  ▼
+#   ③ ⑥ 在这种布局下都是空操作（每个 rank 已有全部行）
+#
+# 图示二：RSAG 布局（4 张卡：注意力 TP=2 × DP=2，MLP TP=4）
+#   注意力 TP 宽度 2 ≠ MLP TP 宽度 4，所以用 reduce-scatter + all-gather。
+#   attention DP：rank 0、1 一组处理批次 X（301 行），rank 2、3 一组处理批次 Y（200 行）。
+#   层出口 reduce-scatter 后，每个 rank 只持有本组的一部分行（前面的 rank 多分一行）：
+#     rank 0：X 的第 0~150 行（151 行）    rank 1：X 的第 151~300 行（150 行）
+#     rank 2：Y 的第 0~99 行（100 行）     rank 3：Y 的第 100~199 行（100 行）
+#
+#        rank 0        rank 1              rank 2        rank 3
+#   ① 各自对自己的那份行做 相加残差 + input_layernorm（行数 151 / 150 / 100 / 100）
+#        │              │                    │              │
+#   ③ 注意力 TP 组内 all-gather，拼回本组完整的行
+#        ◄══ all-gather ══►                  ◄══ all-gather ══►
+#     [301,4096]     [301,4096]          [200,4096]     [200,4096]
+#   ④ 注意力（组内各算一半的头），o_proj 输出部分和
+#   ⑤ 注意力 TP 组内 reduce-scatter，每个 rank 拿回自己那份行的完整和，再 相加残差 + norm
+#        ◄═ reduce-scatter ═►                ◄═ reduce-scatter ═►
+#     [151,4096]     [150,4096]          [100,4096]     [100,4096]
+#   ⑥ MLP TP 组（4 个 rank）内 all-gather，每个 rank 都拿到全部 501 行
+#        ◄═══════════════════════ all-gather ═══════════════════════►
+#     [501,4096]     [501,4096]          [501,4096]     [501,4096]
+#   ⑦ MLP（各算 1/4 的 intermediate，即 3072），down_proj 输出部分和 [501,4096]
+#   ⑧ MLP TP 组内 reduce-scatter，每个 rank 拿回自己那份行
+#        ◄═════════════════════ reduce-scatter ═════════════════════►
+#     [151,4096]     [150,4096]          [100,4096]     [100,4096]    ← 进入下一层的 ①
+#
+#   第 0 层略有不同：embedding 输出的是本组的完整行，所以 ③ 不需要 all-gather，
+#   ⑤ 的 reduce-scatter 之后，残差直接从完整行中切出本 rank 的那份。
 
 
 # 如果本层需要捕获（投机解码的草稿模型要用目标模型的中间 hidden，第 11 阶段），
