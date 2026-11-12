@@ -528,7 +528,7 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 
 - [x] 第 0 阶段：术语表
 - [x] 第 1 阶段：模型骨架
-- [ ] 第 2 阶段：基础层零件
+- [x] 第 2 阶段：基础层零件
 - [ ] 第 3 阶段：注意力与 KV cache 主线
 - [ ] 第 4 阶段：一次前向的组织
 - [ ] 第 5 阶段：logits 与采样
@@ -571,18 +571,18 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 
 | 文件 | 行数 | 等级 |
 | --- | --- | --- |
-| `runtime/distributed/comm_manager.py` | 826 | S |
-| `runtime/layers/linear.py` | 1747 | S |
-| `runtime/layers/rotary_embedding.py` | 1533 | S |
-| `runtime/distributed/mapping.py` | 827 | A |
-| `runtime/layers/activation.py` | 225 | A |
-| `runtime/layers/layernorm.py` | 759 | A |
-| `runtime/layers/mlp.py` | 203 | A |
-| `runtime/layers/parameter.py` | 475 | A |
-| `runtime/layers/vocab_parallel_embedding.py` | 734 | A |
-| `runtime/layers/segmented_rmsnorm.py` | 76 | B |
-| `runtime/layers/common.py` | 35 | C |
-| `runtime/layers/utils.py` | 33 | C |
+| `runtime/distributed/comm_manager.py` | 826 | S ✅ |
+| `runtime/layers/linear.py` | 1747 | S ✅ |
+| `runtime/layers/rotary_embedding.py` | 1533 | S ✅ |
+| `runtime/distributed/mapping.py` | 827 | A ✅ |
+| `runtime/layers/activation.py` | 225 | A ✅ |
+| `runtime/layers/layernorm.py` | 759 | A ✅ |
+| `runtime/layers/mlp.py` | 203 | A ✅ |
+| `runtime/layers/parameter.py` | 475 | A ✅ |
+| `runtime/layers/vocab_parallel_embedding.py` | 734 | A ✅ |
+| `runtime/layers/segmented_rmsnorm.py` | 76 | B ✅ |
+| `runtime/layers/common.py` | 35 | C ✅ |
+| `runtime/layers/utils.py` | 33 | C ✅ |
 
 ### 第 3 阶段：注意力与 KV cache（主线）（25 个文件）
 

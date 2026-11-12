@@ -20,13 +20,20 @@
 
 """Layer helpers shared by model definitions."""
 
+# 译：供模型定义使用的层辅助函数。
+
 from __future__ import annotations
 
 import re
 
 
+# 从权重名中取出层号，取不到返回 None。
+# 加载权重时用来判断一个 checkpoint 张量属于哪一层（例如 MoE 专家权重加载器按层号归组）。
+#   "model.layers.10.self_attn.qkv_proj.weight" -> 10
+#   "model.embed_tokens.weight" -> None
 def get_layer_id(weight_name: str) -> int | None:
     # example weight name: model.layers.10.self_attn.qkv_proj.weight
+    # 译：权重名示例：model.layers.10.self_attn.qkv_proj.weight
     match = re.search(r"layers\.(\d+)\.", weight_name)
     if match:
         return int(match.group(1))
