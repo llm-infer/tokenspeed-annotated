@@ -18,8 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# 导入各注意力后端模块。每个模块在导入时调用 register_backend(名字, 支持的注意力架构, 类)，
+# 把自己登记到 layers/attention/registry.py 的后端注册表中；启动时再按配置从表中选出后端。
+# 部分后端只在特定硬件上导入：FlashMLA 需要 Hopper 及以上，TRT-LLM / tokenspeed-mla 需要 NVIDIA。
+# 主线（Qwen3）使用的 MHA 后端来自下面的 paged/mha.py。
 # ruff: noqa: E402,F401
 # Import all backend modules to trigger register_backend() calls.
+# 译：导入所有后端模块，以触发 register_backend() 调用。
 from tokenspeed_kernel.platform import current_platform
 
 platform = current_platform()

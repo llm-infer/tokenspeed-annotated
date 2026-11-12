@@ -17,3 +17,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+# 分页注意力后端的包（KV 按页存放的各种注意力实现：MHA、MLA、DSA、MSA、QSA 等，以及把它们组合起来的
+# CacheGroupRouter）。本文件为空；各后端模块由上一级的 backends/__init__.py 导入并完成注册。

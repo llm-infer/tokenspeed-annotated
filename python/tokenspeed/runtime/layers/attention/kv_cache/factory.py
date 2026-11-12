@@ -1,5 +1,11 @@
 """Concrete cache-pool construction from a prepared cache spec."""
 
+# 译：根据准备好的 cache spec 构造具体的 cache 池。
+
+# 创建 arena 和 KV 池的工厂（由 layers/attention/registry.py 在启动时调用）。
+#   create_cache_arena：按 cache 规划的结果（CachePoolSpec）分配 arena，一个模型一个
+#   create_cache_pool：按“cache 家族”（spec.family）选择 KV 池的类，在 arena 上创建视图
+# 家族与 KV 池的对应见 _POOL_FACTORIES。Qwen3 的家族是 "mha"，创建 MHATokenToKVPool（bf16）。
 from collections.abc import Callable
 
 from tokenspeed.runtime.layers.attention.configs.base import (
@@ -25,6 +31,7 @@ def create_cache_arena(
     enable_memory_saver: bool,
 ) -> CacheArena:
     """Allocate the one arena every compute view of this spec shares."""
+    # 译：分配本 spec 的所有计算视图共享的那一个 arena。
     return CacheArena(
         spec.memory_plan,
         device,
@@ -42,6 +49,9 @@ def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
     aliasing (and the scale planes) differ, which is the class's business, not
     the caller's.
     """
+    # 译：某个家族使用的 MHA 形状的池，普通版或 mxfp8 版。
+    #
+    #     所有支持的家族接受相同的参数；不同之处只在于递归状态的共用（以及 scale 平面），这是类自己的事，而不是调用方的事。
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_inkling import (
         HybridInklingTokenToKVPool,
         HybridInklingTokenToKVPoolMXFP8,
@@ -215,6 +225,8 @@ def _msa_pool(
     )
 
 
+# MHA 形状的池：按 TP 切分后的 KV 头数（至少 1）、head_dim、层数，以及异构头数信息。
+# Qwen3-8B、TP=1：head_num = 8 // 1 = 8，head_dim = 128，layer_num = 36
 def _mha_shaped_pool(
     spec: CachePoolSpec,
     config: AttnConfig,
@@ -232,6 +244,7 @@ def _mha_shaped_pool(
     pool_cls = _mha_pool_class(spec.family, mxfp8=bool(config.kv_cache_mxfp8))
     # Only the hybrid pools route layers by label; a plain MHA pool has no
     # state layers to tell apart.
+    # 译：只有混合池按标签区分各层；普通 MHA 池没有需要区分的 state 层。
     hybrid_kwargs = (
         {"layer_types": spec.layer_types}
         if issubclass(pool_cls, HybridMHATokenToKVPool)
@@ -305,6 +318,7 @@ def _hybrid_kda_pool(
     )
     if isinstance(softmax_attn, DSAConfig):
         # Kimi-K3.1: MLA layers carry index-K planes in the DSA leaf's kernel pages.
+        # 译：Kimi-K3.1：MLA 层在 DSA 叶子的 kernel 页中携带 index-K 平面。
         return HybridKDADSATokenToKVPool(
             index_head_dim=softmax_attn.index_head_dim,
             index_k_page_size=dsa_kernel_page_size(config),
@@ -316,6 +330,8 @@ def _hybrid_kda_pool(
 # family -> the pool its recipe's plan binds to. A factory takes
 # ``(spec, config, arena, *, num_layers, rank, field_layer_offset)``. Plugins
 # add families via ``tokenspeed.runtime.plugins.registry.register_cache_pool``.
+# 译：家族 -> 其 recipe 的计划所绑定的池。工厂接受 ``(spec, config, arena, *, num_layers, rank, field_layer_offset)``。
+#     插件通过 ``tokenspeed.runtime.plugins.registry.register_cache_pool`` 增加家族。
 _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "mha": _mha_shaped_pool,
     "inkling": _mha_shaped_pool,
@@ -347,6 +363,10 @@ def create_cache_pool(
     merged plan's global layer window, so a draft view names the
     continuation fields the target's plan already reserved.
     """
+    # 译：把一个模型的计算视图绑定到已经分配好的 arena 上。
+    #
+    #     ``field_layer_offset`` 把本视图的局部层 id 放到合并计划的全局层窗口上，这样草稿视图就能指向目标模型的计划
+    #     已经预留的续写字段。
     factory = _POOL_FACTORIES.get(spec.family)
     if factory is None:
         raise TypeError(f"no cache pool is registered for family {spec.family!r}")

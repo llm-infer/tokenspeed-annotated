@@ -29,11 +29,24 @@ only source, so the eager and CUDA-graph arms can never answer
 differently).
 """
 
+# 译：从池发布的 spec 中得知的 cache group 几何。
+#
+#     一个不可变的值对象回答后端提出的所有“这个组是什么形状？”的问题——各组的 block 粒度、每个组的类型
+#     （``cache_consumer_attn_kinds`` 据以筛选的正向声明词汇），以及哪个组是草稿链沿着写入的全历史组。只在
+#     ``set_cache_pool`` 时得知一次（arena 发布的 spec 是唯一来源，所以 eager 和 CUDA Graph 两条路径的回答永远不会不同）。
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 
+# cache group 的几何信息（启动时从 KV 池的 cache group spec 中学到一次）：
+#   granularities：每个非 state 组的 block 粒度（一个 block 覆盖多少 token）
+#   attn_kinds：每个组的类型（full_history / sliding_window / state）
+#   full_history_group_id：全历史组的 id
+#   row_geometry：每个组的物理行布局（每页多少行、每行覆盖多少 token）
+#   windows：每个组的滑动窗口大小（全历史组为 None）
+# Qwen3-8B 只有一个全历史组：granularities = {组 id: P}，attn_kinds = {组 id: "full_history"}。
 @dataclass(frozen=True)
 class CacheGroupGeometry:
     """Frozen per-pool group geometry.
@@ -61,6 +74,21 @@ class CacheGroupGeometry:
             contract, which a rebind must keep as well.
     """
 
+    # 译：冻结的、按池的组几何。
+    #
+    #     属性：
+    #         granularities：每个非 state 组的 ``group_id -> block_granularity``（每页行的跨度；对这里保留的行几何组，
+    #             它等于该组的页大小）。
+    #         attn_kinds：每个已发布组的 ``group_id -> attn_kind``。正向声明的词汇：后端只保留类型在其
+    #             ``cache_consumer_attn_kinds`` 中声明过的已交付组；其余的（mamba 后端的 state block、包装器拥有的 conv 组）
+    #             沿着同一个字典交给它们自己的使用方。没有绑定池时为空（单元测试夹具、契约之前的草稿池）。
+    #         full_history_group_id：第一个 ``attn_kind="full_history"`` 的组——router 的草稿写入位置所依赖的表——
+    #             池没有发布这样的组时为 None（此时单组池的唯一组充当历史）。每次绑定时从池中选出，所以不参与几何的相等比较。
+    #         row_geometry：每个非 state 组的 ``group_id -> (rows_per_page, entry_stride_tokens)``：叶子 kernel 读取的
+    #             物理行布局，所以重新绑定时要保持不变。
+    #         windows：每个非 state 组的 ``group_id -> sliding_window_tokens``（全历史为 None）：调度器的保留契约，
+    #             重新绑定时同样要保持不变。
+
     granularities: dict[str, int] = field(default_factory=dict)
     attn_kinds: dict[str, str] = field(default_factory=dict)
     full_history_group_id: str | None = field(default=None, compare=False)
@@ -76,6 +104,10 @@ class CacheGroupGeometry:
         No fallback: a miss means the geometry was never learned (pool not
         bound) or the id belongs to a state group.
         """
+        # 译：该组的 block 粒度；未知的 id 是契约错误。
+        #
+        #     到达这里的每个 id 都必须是一个已学到的行几何组——层的组 id 在启动时从池的计划中绑定（``bind_cache_groups``），
+        #     表的字典以契约 id 为键。没有回退：查不到意味着从未学到几何（池未绑定），或者该 id 属于一个 state 组。
         try:
             return self.granularities[group_id]
         except KeyError:
@@ -94,6 +126,13 @@ def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
     Returns:
         The frozen geometry.
     """
+    # 译：从池发布的组 spec 构建几何。
+    #
+    #     参数：
+    #         cache_group_specs：arena 的 ``cache_group_specs`` 元组。
+    #
+    #     返回：
+    #         冻结的几何。
     full_history = next(
         (spec for spec in cache_group_specs if spec.attn_kind == "full_history"), None
     )
