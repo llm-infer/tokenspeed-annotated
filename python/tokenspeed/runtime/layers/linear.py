@@ -1066,11 +1066,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
         output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
-            # 译：q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            # 译：k_proj
             self.num_kv_heads * self.head_size * tp_size,  # v_proj
-            # 译：v_proj
         ]
         super().__init__(
             input_size=input_size,
@@ -1126,7 +1123,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         #     https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
-            # 译：(shard_id, shard_offset, shard_size)
             ("q", 0, self.total_num_heads * self.head_size),
             (
                 "k",
@@ -1239,7 +1235,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                 return
             shard_offsets = [
                 # (shard_id, shard_offset, shard_size)
-                # 译：(shard_id, shard_offset, shard_size)
                 ("q", 0, self.total_num_heads * self.head_size),
                 (
                     "k",

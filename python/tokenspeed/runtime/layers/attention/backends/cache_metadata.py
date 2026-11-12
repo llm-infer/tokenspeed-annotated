@@ -18,6 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+# CacheBatchMetadata：一次前向的 block table（每个 cache group 一张），校验并上传到 GPU 后的封装。
+#
+# 你在这里：ModelExecutor.execute_forward_op 开头（第 4 阶段）调用 from_forward_op 构造它，
+# 随后把 tables(...) 交给注意力后端（CacheGroupRouter）换算成 kernel 页表。
+#
+# 设计要点：
+#   1. 只能通过工厂方法 from_forward_op 构造（直接构造会报错），保证每份表都经过校验
+#   2. 持有生成它的那个 forward_op 的强引用，取表时检查“是不是当前这次前向的”，
+#      防止 overlap 调度下误用上一轮或下一轮的旧表（stale metadata）
+#   3. 有 extend 的批次额外保留一份 Host 副本（tables_cpu），后端规划 extend 时读它，不必等 GPU
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -44,9 +54,15 @@ class CacheBatchMetadata:
         group_ids: Cache group IDs in runtime-contract order.
     """
 
+    # 译：只能由工厂创建的视图，绑定到一次调度器前向操作。
+    #
+    #     属性：
+    #         group_ids：按运行时契约顺序排列的 cache group ID。
+
     group_ids: tuple[str, ...]
     _group_tables: Mapping[str, torch.Tensor] = field(repr=False, compare=False)
     # None unless the factory was asked for host tables.
+    # 译：除非工厂被要求生成 Host 表，否则为 None。
     _group_tables_cpu: Mapping[str, torch.Tensor] | None = field(
         repr=False, compare=False
     )
@@ -77,9 +93,15 @@ class CacheBatchMetadata:
         copy for ``tables_cpu``: a forward with extends plans from it, a pure
         decode never reads it.
         """
+        # 译：对照契约检查这些表，打包一次，并保留生成它的操作。
+        #
+        #     组集合、dtype、形状和行数总是会检查。开启 ``validate_page_ids`` 时，还会对照每个组的虚拟 block 数扫描每个页 ID：
+        #     在调度器之外构建的表（prefill graph 捕获）总是要求扫描，调度器构建的表在 ``TOKENSPEED_VALIDATE_PAGE_IDS`` 下扫描。
+        #     ``host_tables`` 还会为 ``tables_cpu`` 保留一份 Host 副本：带 extend 的前向根据它做规划，纯 decode 从不读它。
         if forward_op is None:
             raise ValueError("forward_op must not be None")
         require_positive_int("num_reqs", num_requests)
+        # 每个组的最大合法页号 = 该组虚拟 block 数 - 1（第 0 页是保留的空页，也计入总数）
         group_ids = tuple(spec.group_id for spec in contract.group_specs)
         counts = contract.virtual_block_counts
         max_page_ids = {
@@ -105,6 +127,7 @@ class CacheBatchMetadata:
             host_tables=host_tables,
             num_reqs=num_requests,
             # State groups pack last and end to end, so their rows pad in one launch.
+            # 译：state 组排在最后，首尾相接，所以它们的行可以在一次启动中填充。
             expected_group_ids=tuple(
                 spec.group_id
                 for spec in sorted(
@@ -112,6 +135,7 @@ class CacheBatchMetadata:
                 )
             ),
             # The packer scans every page ID against bounds it is given.
+            # 译：打包器会对照给定的边界扫描每个页 ID。
             max_page_ids=max_page_ids if validate_page_ids else None,
         )
         return cls._from_validated_tables(
@@ -127,6 +151,8 @@ class CacheBatchMetadata:
         )
 
     @classmethod
+    # 结构校验：每张表都是 int32、二维、行数等于请求数、宽度大于 0、位于同一设备，
+    # 并且所有组的表共享同一块打包存储（router 一次启动填充所有组的前提）。
     def _from_validated_tables(
         cls,
         *,
@@ -188,9 +214,11 @@ class CacheBatchMetadata:
         )
         # A strong reference makes Python/nanobind object identity safe against
         # id reuse until all metadata views become unreachable.
+        # 译：强引用让 Python/nanobind 对象的身份比较在所有元数据视图都不可达之前，不受 id 复用的影响。
         object.__setattr__(metadata, "_forward_op", forward_op)
         return metadata
 
+    # 检查传入的前向操作就是生成本元数据的那一个（按对象身份比较）
     def _validate_active_forward_op(self, active_forward_op: Any) -> None:
         if active_forward_op is not self._forward_op:
             raise RuntimeError(
@@ -202,11 +230,14 @@ class CacheBatchMetadata:
         freshness validation. The views are this step's own upload, with the
         state groups' tables end to end at its tail: the executor pads
         stopped requests' state rows in them in place."""
+        # 译：在新鲜度校验之后，以只读映射的形式返回每个组的表视图。这些视图是本步自己的上传，state 组的表首尾相接地
+        #     放在末尾：执行器在其中原地填充已停止请求的 state 行。
         self._validate_active_forward_op(active_forward_op)
         return self._group_tables
 
     def tables_cpu(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
         """The same tables as CPU views of one host copy (pinned for a device)."""
+        # 译：同样的表，作为一份 Host 副本（对设备而言是 pinned 内存）的 CPU 视图。
         self._validate_active_forward_op(active_forward_op)
         if self._group_tables_cpu is None:
             raise RuntimeError("this batch's metadata was built without host tables")

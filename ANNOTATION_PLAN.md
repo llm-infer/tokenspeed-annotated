@@ -67,7 +67,7 @@ nano-vllm-annotated 的风格是：**中文注释直接写在源码里**，在�
   - 范围：`#` 注释（包括写在代码行尾的）和 docstring（模块、类、函数的）都要翻译。
   - 位置：`#` 注释的翻译紧跟在原注释块下面；行尾注释的翻译放在该行代码的下一行；docstring 的翻译放在 docstring 结束之后（模块和类的 docstring 之后 black 会强制空一行，译文放在这个空行之后）。
   - 要求：忠实翻译原意，不增不减；原文中的标识符、参数名、命令行选项保持英文。需要补充的解释另起一段讲解性注释，不混进译文。docstring 中的 `Args:` / `Returns:` / `Raises:` 等小节照样逐项翻译。
-  - 不翻译：文件开头的许可证声明、工具指令（如 `# noqa`、`# type: ignore`、`# fmt: off`）、被注释掉的代码。
+  - 不翻译：文件开头的许可证声明、工具指令（如 `# noqa`、`# type: ignore`、`# fmt: off`）、被注释掉的代码，以及只有形状、标识符或代码而没有自然语言的注释（如 `# [G, max_bs] int32`、`# q_proj`）。
   - 与等级无关：B、C 级文件中的英文注释同样要全部翻译。
 - **Shape 记号**全项目统一，定义在第一个注释的文件（`models/qwen3.py`）中，其他文件引用即可：
 
@@ -589,30 +589,30 @@ RuntimeStates 更新（下一轮的输入 token、停止条件）→ complete() 
 | 文件 | 行数 | 等级 |
 | --- | --- | --- |
 | `runtime/layers/attention/backends/base.py` | 902 | S |
-| `runtime/layers/attention/backends/cache_metadata.py` | 213 | S |
+| `runtime/layers/attention/backends/cache_metadata.py` | 213 | S ✅ |
 | `runtime/layers/attention/backends/paged/base.py` | 598 | S |
 | `runtime/layers/attention/backends/paged/mha.py` | 806 | S |
-| `runtime/layers/attention/backends/paged/router.py` | 1234 | S |
-| `runtime/layers/attention/backends/paged/write_locations.py` | 320 | S |
-| `runtime/layers/attention/kv_cache/base.py` | 428 | S |
-| `runtime/layers/attention/kv_cache/mha.py` | 356 | S |
+| `runtime/layers/attention/backends/paged/router.py` | 1234 | S ✅ |
+| `runtime/layers/attention/backends/paged/write_locations.py` | 320 | S ✅ |
+| `runtime/layers/attention/kv_cache/base.py` | 428 | S ✅ |
+| `runtime/layers/attention/kv_cache/mha.py` | 356 | S ✅ |
 | `runtime/layers/paged_attention.py` | 696 | S |
-| `runtime/engine/scheduler_utils.py` | 1084 | A |
-| `runtime/layers/attention/backends/paged/group_tables.py` | 566 | A |
+| `runtime/engine/scheduler_utils.py` | 1084 | A ✅ |
+| `runtime/layers/attention/backends/paged/group_tables.py` | 566 | A ✅ |
 | `runtime/layers/attention/backends/paged/trtllm.py` | 618 | A |
 | `runtime/layers/attention/chunk.py` | 306 | A |
-| `runtime/layers/attention/configs/base.py` | 394 | A |
-| `runtime/layers/attention/configs/mha.py` | 108 | A |
-| `runtime/layers/attention/kv_cache/arena.py` | 643 | A |
-| `runtime/layers/attention/kv_cache/factory.py` | 360 | A |
-| `runtime/layers/attention/page_table.py` | 90 | A |
+| `runtime/layers/attention/configs/base.py` | 394 | A ✅ |
+| `runtime/layers/attention/configs/mha.py` | 108 | A ✅ |
+| `runtime/layers/attention/kv_cache/arena.py` | 643 | A ✅ |
+| `runtime/layers/attention/kv_cache/factory.py` | 360 | A ✅ |
+| `runtime/layers/attention/page_table.py` | 90 | A ✅ |
 | `runtime/layers/attention/registry.py` | 1604 | A |
-| `runtime/layers/attention/backends/paged/cache_group_geometry.py` | 122 | B |
-| `runtime/layers/attention/backends/support.py` | 146 | B |
-| `runtime/layers/attention/kernel_page_sizes.py` | 55 | B |
-| `runtime/layers/attention/utils.py` | 104 | B |
-| `runtime/layers/attention/backends/__init__.py` | 51 | C |
-| `runtime/layers/attention/backends/paged/__init__.py` | 19 | C |
+| `runtime/layers/attention/backends/paged/cache_group_geometry.py` | 122 | B ✅ |
+| `runtime/layers/attention/backends/support.py` | 146 | B ✅ |
+| `runtime/layers/attention/kernel_page_sizes.py` | 55 | B ✅ |
+| `runtime/layers/attention/utils.py` | 104 | B ✅ |
+| `runtime/layers/attention/backends/__init__.py` | 51 | C ✅ |
+| `runtime/layers/attention/backends/paged/__init__.py` | 19 | C ✅ |
 
 ### 第 4 阶段：一次前向的组织（15 个文件）
 

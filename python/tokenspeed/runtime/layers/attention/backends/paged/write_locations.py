@@ -35,6 +35,33 @@ tensors take the Torch path. An optional immutable host page-size mirror
 avoids reading these static constants back from the device.
 """
 
+# 译：基于堆叠的按组 kernel 页表计算 KV 写入位置。
+#
+#     一个不变式，三种形状：``slot = table[req, pos // P] * P + pos % P``，其中 ``P`` 是该组的 kernel 页大小。
+#     decode 为每个请求写入末尾 ``n`` 个位置的窗口（``n == 1`` 为普通 decode，``n == N`` 为目标模型验证或块草稿），
+#     extend 为每个请求按 q/k/v 的 token 顺序写入 ``[prefix, prefix + new)`` 这一段。空页和空洞页（id <= 0）以及
+#     超出页表的位置都被导向槽位 0，即那个初始化为零、永远不会与活跃请求共用的哑页。
+#
+#     每个函数都接收由 router 填充的、堆叠的 ``[G, max_bs, max_num_pages]`` 页表（``group_tables.GroupTableStacks``），
+#     所以所有组的位置由一次启动算出。CUDA 张量运行 triton kernel；CPU 和 NPU 张量走 Torch 路径。一个可选的、
+#     不可变的 Host 端页大小镜像可以避免从设备读回这些静态常量。
+
+# 计算每个新 token 的 KV 写到哪个槽位（slot）。
+#
+# 你在这里：每次前向开始时，CacheGroupRouter 准备元数据时调用（backends/paged/router.py），结果存在 router 的
+# 固定缓冲区里；随后每一层的注意力 prologue 按这些槽位把本层的 K/V 写进 KV 池。
+#
+# slot = 页号 × P + 页内偏移 这条公式是熟悉的。本文件的不同之处：
+#   1. 在 GPU 上由 Triton kernel 直接从页表和序列长度算出，不在 CPU 上逐个拼接再拷贝
+#   2. 一次 kernel 启动同时算出所有 cache group 的写入位置（每个组的页大小可以不同；Qwen3 只有 1 组）
+#   3. decode 支持每个请求写多个 token（投机解码的验证窗口，第 11 阶段）
+#   4. 注意：没有“-1 表示不写”。页号 <= 0 的空页、以及位置超出页表的情况（例如 CUDA Graph 的 padding 行）
+#      都写到 slot 0。第 0 页是保留的哑页，从不分配给真实请求，所以写进去的东西不会污染任何请求的 KV。
+#
+# 贯穿例子（P=64）：
+#   A：extend，prefix=0，新 token 300 个 -> 位置 0..299，占 5 个页（300 = 4×64 + 44）。
+#      若 A 的页表为 [12, 3, 40, 7, 21]，第 299 个 token：页序号 4、偏移 43 -> 页 21 -> slot = 21×64 + 43 = 1387
+#   B：decode，seq_len=1001（含本次新 token）-> 位置 1000：页序号 15、偏移 40 -> slot = B 的页表[15]×64 + 40
 from __future__ import annotations
 
 import torch
@@ -42,6 +69,10 @@ import torch
 from tokenspeed.runtime.utils.triton import tl, triton
 
 
+# decode 写入位置的 kernel。grid = (组数, ceil(总 token 数 / BLOCK))，每个 program 处理一个组的 BLOCK 个 token。
+# 第 tok 个输出属于第 tok // n 个请求的第 tok % n 步，位置 = seq_len + seq_len_offset - n + step。
+# do_not_specialize：这几个参数每批都会变，不让 Triton 按它们的值分别编译（避免运行时反复编译）。
+# 注意偏移计算先转成 int64，最后存成 int32。
 @triton.jit(do_not_specialize=["num_tokens", "tokens_per_req", "seq_len_offset"])
 def _decode_locs_kernel(
     tables_ptr,  # [G, max_bs, max_num_pages] int32
@@ -55,11 +86,13 @@ def _decode_locs_kernel(
     num_tokens,  # bs * tokens_per_req
     tokens_per_req,
     seq_len_offset,  # added to every loaded length
+    # 译：加到每个读入的长度上
     BLOCK: tl.constexpr,
 ):
     g = tl.program_id(0)
     start = tl.program_id(1) * BLOCK
     tok = start + tl.arange(0, BLOCK)  # token-major index into out[g]
+    # 译：out[g] 中以 token 为主序的下标
     mask = tok < num_tokens
     req = tok // tokens_per_req
     step = tok % tokens_per_req
@@ -67,6 +100,7 @@ def _decode_locs_kernel(
     pos = tl.maximum(seq_len + seq_len_offset - tokens_per_req + step, 0)
     page_size = tl.load(page_sizes_ptr + g).to(tl.int64)
     page_idx = pos // page_size
+    # 超出页表宽度的位置，以及空页（页号 <= 0），都写到 slot 0（哑页）
     overflow = page_idx >= max_num_pages
     page_idx = tl.minimum(page_idx, max_num_pages - 1)
     page = tl.load(
@@ -77,6 +111,8 @@ def _decode_locs_kernel(
     tl.store(out_ptr + g * out_stride_g + tok, loc.to(tl.int32), mask=mask)
 
 
+# extend 写入位置的 kernel。grid = (组数, 请求数)，每个 program 处理一个组的一个请求，
+# 按 BLOCK 循环覆盖该请求的全部新 token：位置 = prefix + 0..num_new-1，输出写到 cu_extend_lens[req] 开始的那一段。
 @triton.jit(do_not_specialize=["max_num_pages", "out_stride_g"])
 def _extend_locs_kernel(
     tables_ptr,  # [G, max_bs, max_num_pages] int32
@@ -116,8 +152,10 @@ def _extend_locs_kernel(
         )
 
 
+# 下面两个是 Torch 参考实现（CPU / NPU 使用），逻辑与上面的 Triton kernel 相同
 def _decode_positions(seq_lens: torch.Tensor, tokens_per_req: int) -> torch.Tensor:
     """``[bs * n]`` token-major write positions of the trailing window."""
+    # 译：末尾窗口中、以 token 为主序的 ``[bs * n]`` 个写入位置。
     n = tokens_per_req
     lens = seq_lens.to(torch.int64)
     if n == 1:
@@ -131,6 +169,7 @@ def _gather_slots(
 ) -> torch.Tensor:
     """Torch reference of the slot rule for one group's
     ``[max_bs, max_num_pages]`` table."""
+    # 译：对一个组的 ``[max_bs, max_num_pages]`` 页表，槽位规则的 Torch 参考实现。
     max_num_pages = table.shape[1]
     page_idx = pos // page_size
     overflow = page_idx >= max_num_pages
@@ -169,6 +208,17 @@ def decode_write_locations(
             ``page_sizes``. Used only by the Torch fallback; absent keeps
             the original device-scalar path.
     """
+    # 译：把每个组的 decode 写入槽位填进 ``out[:, : bs * tokens_per_req]``。
+    #
+    #     参数：
+    #         tables：``[G, max_bs >= bs, max_num_pages]``，int32 的堆叠 kernel 页表。
+    #         page_sizes：``[G]``，每个组的 int32 kernel 页大小。
+    #         seq_lens：``[>= bs]``，int32 的长度，包含最新的 token；请求 ``b`` 写入位置 ``seq_lens[b] - n .. seq_lens[b] - 1``。
+    #         out：``[G, cap]`` 的 int32 目标，``cap >= bs * tokens_per_req``；按请求、以 token 为主序填充（验证的布局）。
+    #         bs：要计算的请求数（padding 的请求读到 seq_len 1，落在槽位 0）。
+    #         tokens_per_req：末尾窗口的宽度 ``n``。
+    #         page_sizes_cpu：可选的 Host 元组，来自与 ``page_sizes`` 相同的组 spec。只用于 Torch 回退路径；
+    #             不提供时保留原来的设备标量路径。
     _write_locations(
         tables,
         page_sizes,
@@ -181,6 +231,7 @@ def decode_write_locations(
     )
 
 
+# 与 decode 相同，只是给出的是窗口起点而不是序列长度（投机解码的草稿步使用）
 def window_write_locations(
     tables: torch.Tensor,
     page_sizes: torch.Tensor,
@@ -192,6 +243,7 @@ def window_write_locations(
     page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> None:
     """:func:`decode_write_locations` of the windows ``start .. start + n - 1`` for ``window_starts[:bs]``."""
+    # 译：对 ``window_starts[:bs]`` 的窗口 ``start .. start + n - 1`` 执行 :func:`decode_write_locations`。
     _write_locations(
         tables,
         page_sizes,
@@ -213,6 +265,8 @@ def _validate_cpu_page_sizes(page_sizes_cpu, num_groups):
         raise ValueError("host page sizes must contain positive integers")
 
 
+# decode 写入位置的共同实现：GPU 上启动 Triton kernel；否则走 Torch 路径。
+# out 是 router 的固定缓冲区，容量不够时直接报错（说明预分配的大小与本批不匹配）。
 def _write_locations(
     tables: torch.Tensor,
     page_sizes: torch.Tensor,
@@ -287,9 +341,24 @@ def extend_write_locations(
         ``out``. The optional ``page_sizes_cpu`` host tuple replaces only
         static page-size scalar reads on the Torch fallback.
     """
+    # 译：每个组的 extend 写入槽位，``[G, total_tokens]``，按 q/k/v 的 token 顺序（以请求为主序，``cu_extend_seq_lens`` 布局），
+    #     写入 ``out``。
+    #
+    #     参数：
+    #         tables：``[G, max_bs >= bs, max_num_pages]``，int32 的堆叠 kernel 页表。
+    #         page_sizes：``[G]``，每个组的 int32 kernel 页大小。
+    #         extend_prefix_lens：``[bs]``，int32，每个请求已缓存的前缀长度。
+    #         extend_seq_lens：``[bs]``，int32，每个请求的新 token 数。
+    #         total_tokens：来自 Host 镜像的 ``sum(extend_seq_lens)``——这里不做设备同步。
+    #         out：要填充的 ``[G, total_tokens]`` 个 int32 行；是 router 持久缓冲区的一个视图，所以捕获的 graph 可以记录它的地址。
+    #
+    #     返回：
+    #         ``out``。可选的 ``page_sizes_cpu`` Host 元组只替换 Torch 回退路径上对静态页大小标量的读取。
     bs = extend_seq_lens.shape[0]
     if total_tokens == 0 or tables.shape[0] == 0 or bs == 0:
         return out
+    # cu_extend：新 token 数的前缀和，决定每个请求的写入位置在输出中从哪里开始。
+    # 例：A 300 个新 token、只有 A 做 extend -> cu_extend = [0, 300]
     cu_extend = torch.zeros(bs + 1, dtype=torch.int32, device=tables.device)
     torch.cumsum(extend_seq_lens, dim=0, out=cu_extend[1:])
     if tables.is_cuda:
