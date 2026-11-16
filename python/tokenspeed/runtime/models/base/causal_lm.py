@@ -49,6 +49,14 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.moe import MoECheckpointLoader
 
 
+# 装饰器，记录本次加载写入了哪些参数
+# 
+# 为什么需要？
+#   普通加载：完整权重 -> 内存 -> 显存 -> 加载完成
+#   分块加载：chunk1、chunk2、chunk3
+#                 ↓  多次调用 load_weights
+#               加载完成
+#   分块加载需要检查所有分块是否完整、遗漏、重复
 def _record_loaded_names(load_weights: Callable) -> Callable:
     """Track physical parameter writes and the canonical source stream.
 
@@ -59,12 +67,17 @@ def _record_loaded_names(load_weights: Callable) -> Callable:
 
     @functools.wraps(load_weights)
     def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> Any:
+        # 记录加载函数的嵌套深度
+        # 在最外层最适合检查checkpoint权重名称
+        # 内层可能把名称改成了合并参数，或者rank本地参数名
         depth = self._weight_update_load_depth
         self._weight_update_load_depth = depth + 1
         checked_stream = None
         try:
             if depth == 0:
+                # 发现 KV scale≠1 就记到 rejected
                 rejected = self._weight_update_non_unit_kv_scales
+                # 每个名字检查"是否意外/重复"
                 complete = self._weight_update_required_names is not None
                 if rejected is not None or complete:
                     weights = args[0] if args else kwargs["weights"]
@@ -80,6 +93,7 @@ def _record_loaded_names(load_weights: Callable) -> Callable:
                     else:
                         kwargs["weights"] = weights
             loaded = load_weights(self, *args, **kwargs)
+            # 检查是不是所有权重都读了一遍
             if checked_stream is not None:
                 # Receiving every required name is not sufficient if a loader
                 # returned early and left part of its input unconsumed.
@@ -107,6 +121,11 @@ def _derive_once(post_load_weights: Callable) -> Callable:
 
     @functools.wraps(post_load_weights)
     def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> None:
+        # 判断当前是否处于在线更新
+        #   是：设置标记
+        #   否：立刻执行
+        # 没有它:  块1→派生  块2→派生  块3→派生 ...   (N 次,且每次都在半新半旧的权重上)
+        # 有了它:  块1→记待办 块2→记待办 块3→记待办 ... end→派生 1 次
         if self._weight_update_active:
             self._weight_update_derive_pending = True
             return
@@ -115,6 +134,17 @@ def _derive_once(post_load_weights: Callable) -> Callable:
     return wrapper
 
 
+# BaseCasualLM是所有因果模型的公共基类：主干BaseTransformerModel+lm_head+LogitsProcessor
+#   主干model：计算hidden states
+#   lm_head：把hidden变成各词的分数
+#   LogitProcessor：围绕lm_head的流程
+#       挑出要采样的行：每个请求一行
+#       调用lm_head做矩阵乘
+#       按lm_head的切法整理结果
+#       打包成LogitsProcessorOutput
+#
+# 再加上通用的权重加载流程，具体模型只需要指定model_cls，必要时提供权重名映射
+# 本身不包含任何模型实现，只是制定流程骨架，具体实现由子类提供
 class BaseCausalLM(nn.Module):
     """Model + lm_head + logits_processor, plus the live weight-update session.
 
@@ -158,18 +188,30 @@ class BaseCausalLM(nn.Module):
     takes part in sessions.
     """
 
+    # post_load_weights必须可重复执行
+    # 1. 写入已存在的张量，而不是新建张量。因为CUDA Graph在捕获时记的是张量显存地址
+    # 2. 只对被重新加载的参数做原地变换，比如把权重乘个系数。如果对没更新的参数也做一遍,就乘了两次
+
+    # 子类必须指定的主干类型
     model_cls: type[BaseTransformerModel]
+    # 默认值，子类可覆盖
     logits_processor_cls: ClassVar[type[LogitsProcessor]] = LogitsProcessor
     # Whether the model's MoE layers route through the process-global expert
     # placement (redundant replicas, load counters; ``moe/expert_location.py``)
     # and its loader fills every placed slot. ``build_expert_placement``
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
+
+    # MoE 是否支持专家放置(冗余副本、负载计数)。不支持的模型被传了相关参数会直接拒绝
     supports_expert_placement: ClassVar[bool] = False
     # Opt in only when complete checkpoint loading and non-parameter state
     # restoration are both defined for this model.
+    
+    # 是否支持“丢弃权重存储”，要求定义了完整的 checkpoint 加载和非参数状态的恢复
     supports_weight_discard: ClassVar[bool] = False
     # Opt in only when ``self.model`` returns the taps ``layers_to_capture`` names (EAGLE3, DFLASH).
+    
+    # self.model会返回layers_to_capture时（EAGLE3、DFLASH），才开启
     supports_aux_capture: ClassVar[bool] = False
 
     @property
@@ -186,6 +228,8 @@ class BaseCausalLM(nn.Module):
         MoE block's ``get_moe_routed_weights()``. It is never assigned (an
         assignment to a setter-less property raises at load time).
         """
+        # 每个MoE层的权重张量
+        # eplb均衡负载时，会移动这些张量
         raise NotImplementedError(
             f"{type(self).__name__} does not expose its routed expert weights per "
             "layer; --enable-eplb needs routed_experts_weights_of_layer"
@@ -193,15 +237,19 @@ class BaseCausalLM(nn.Module):
 
     # Live weight-update session (see the class docstring). Declared here
     # with defaults and assigned again in ``__init__``.
+    # 是否在在线更新权重
     _weight_update_active: bool = False
     # Parameter names ``load_weights`` touched during the active session;
     # None outside a session (the initial load touches everything).
+    # 本次更新写过哪些参数
     _weight_update_loaded_names: set[str] | None = None
     # A ``post_load_weights`` call was deferred by the session.
+    # 有没有被推迟的会话
     _weight_update_derive_pending: bool = False
     # KV-cache scales other than one seen by this session's ``load_weights``
     # calls (KV caches are written and read at unit scale); None outside a
     # session, where the loader screens the checkpoint itself.
+    # 本次会话中不等于 1 的 KV cache scale
     _weight_update_non_unit_kv_scales: list[str] | None = None
     # Canonical checkpoint names, distinct from the physical parameter names
     # above. Complete sessions require each source exactly once.
@@ -210,6 +258,8 @@ class BaseCausalLM(nn.Module):
     _weight_update_load_failed: bool = False
     _weight_update_load_depth: int = 0
 
+    # 定义子类时自动执行：如果子类自己定义了 load_weights / post_load_weights，
+    # 就给它们套上上面两个装饰器。这样子类不用关心在线权重更新会话的存在。
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         load_weights = cls.__dict__.get("load_weights")
@@ -248,20 +298,25 @@ class BaseCausalLM(nn.Module):
             # logits processor (the LM allocation is the OOM at encode TP=1).
             # self.config is already set above for the vision path
             # (separate_deepstack_embeds needs self.config.hidden_size).
+            # 纯视觉模型，不需要语言模型、lm_head、logits processor
             self.model = None
             self.lm_head = None
             self.logits_processor = None
         else:
             self.model = self.resolve_model(config, mapping, quant_config, prefix)
+            # pp并行，只有最后一个stage需要lm_head和logits
+            # 不开pp时默认是1，本rank就是最后一个stage
             if mapping.is_last_pp_rank:
                 self.lm_head = self.resolve_lm_head(config, quant_config, prefix)
                 self.logits_processor = self.resolve_logits_processor(config)
             else:
                 # Mid-pipeline stages emit hidden states, never logits.
+                # 流水线并行的中间阶段只生成hidden state，不生成logits
                 self.lm_head = None
                 self.logits_processor = None
         self.post_init()
 
+    # 创建主干模型实例
     def resolve_model(
         self,
         config: PretrainedConfig,
@@ -277,6 +332,11 @@ class BaseCausalLM(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
+    # 创建 lm_head
+    # 1. tie_word_embeddings：lm_head与embedding共享一张[V, H]表
+    #       [V, H]是id -> embedding的映射，embedding是根据id查embedding，
+    #       lm_head是根据hidden state计算每个embedding的相似度，两者可以复用一张表
+    # 2. 
     def resolve_lm_head(
         self,
         config: PretrainedConfig,
@@ -289,6 +349,33 @@ class BaseCausalLM(nn.Module):
 
         # mapping.lm_head follows attention TP without attention DP and is
         # replicated (tp 1) under it unless --lm-head-tp-size widens it.
+        
+        # lm_head的切分条件为什么要特殊考虑DP？
+        # 
+        # 情况1：无DP，lm_head_tp=2：所有rank都拿着同一份hidden，各算半个词表
+        # rank0 与 rank1 的 hidden 完全相同 [301, 4096]
+        # │
+        # ├─ ① 挑行(gather_ids = [299, 300])
+        # │     hidden_sel [2, 4096]            ← 两个 rank 一样
+        # │
+        # ├─ ② 各算自己那半词表
+        # │     rank0: [2,4096] × W[0:75968]^T      → [2, 75968]
+        # │     rank1: [2,4096] × W[75968:151936]^T → [2, 75968]
+        # │
+        # └─ ③ all-gather(沿词表维拼接)
+        #         两个 rank 都得到 [2, 151936]
+        # 
+        # 情况2：attn DP=2，lm_head不切，每个rank只算自己的请求，零通信
+        # 
+        # 情况3：attn DP=2，lm_head_tp=2，dp_lm_head_tp=true
+        #               rank0：有 A         rank1：有B
+        #                   │                 │
+        #   ① 各自挑行:   [1,4096]       [1,4096]
+        #                   │                 │
+        #   ② 先把 hidden 跨组收集(all-gather)
+        #       两个 rank 都得到 [2, 4096](A 和 B 的行都有)
+        #   ③ 各算自己那半词表
+        #   ④ 把结果送回各请求的主人
         if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             return ReplicatedLinear(
                 config.hidden_size,
@@ -308,6 +395,8 @@ class BaseCausalLM(nn.Module):
             tp_group=self.mapping.lm_head.tp_group,
         )
 
+    # 创建 LogitsProcessor，根据lm_head的切分方式，
+    # 决定如何通过各rank输出的logits拼回完整词表
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
         return self.logits_processor_cls(
@@ -331,6 +420,11 @@ class BaseCausalLM(nn.Module):
                 "EAGLE3 and DFLASH drafts cannot attach to it"
             )
 
+    # 投机解码时，由草稿器调用，指定目标模型需要捕获哪些层的hidden
+    # 层号i捕获的是第i层的输入，也就是第i-1层的输出
+    # 
+    # EAGLE3：默认捕获靠前、中间、靠后三层的输入
+    # 显示给出layer_ids时，它们指的是层输出，需要+1转为层的残差（即下一层的输入）
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 
         self.require_aux_capture()
@@ -345,6 +439,10 @@ class BaseCausalLM(nn.Module):
 
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    # 捕获DFLASH/DSPARK草稿器所需目标模型的hidden states
+    # 例子:L=36,layer_ids=[1,17,35]:
+    #   捕获层号是 [2, 18, 37]（layer_ids+1）
+    #   _dflash_capture_idx_map = {2:0, 18:1, 37:2}（记录每个层号的顺序）
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture the target hidden states a DFLASH/DSpark draft consumes.
 
@@ -378,6 +476,9 @@ class BaseCausalLM(nn.Module):
             layer_idx: i for i, layer_idx in enumerate(capture_layers)
         }
 
+    # no_grad：跳过反向图计算
+    #   最后一层：交给logits_processor
+    #   其它层：返回hidden_states给下一层
     @torch.no_grad()
     def forward(
         self,
@@ -437,19 +538,40 @@ class BaseCausalLM(nn.Module):
 
     # Weight loading.
 
+    # checkpoint 权重名 -> 合并参数名的映射
+    #   每项 (合并参数名, checkpoint权重名，shard_id)
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
 
         return []
 
+    # 忽略名字包含这些字符串的checkpoint权重名
+    # 有些checkpoint带着RoPE的inv_freq缓存，本项目自己算cos/sin表，用不到该缓存
     def get_skip_weight_names(self) -> list[str]:
 
         return ["rotary_emb.inv_freq"]
 
+    # MoE模型返回专家权重的加载器，稠密模型返回None
     def get_expert_checkpoint_loader(self) -> MoECheckpointLoader | None:
         """The loader for this rank's routed experts, or None without experts."""
 
         return None
 
+    # 通用的权重加载流程
+    # weights：checkpoint张量迭代器，由model_loader从safetensor文件读出
+    # 每个张量按顺序尝试四条规则
+    #   1. 命中get_skip_weight_names，跳过
+    #   2. 是MoE专家权重，交给专家加载器；不属于本rank的专家（在其他EP rank），跳过
+    #   3. 命中get_stacked_params_mapping -> 改名为合并参数，传入shard_id调用weight_loader
+    #   4. 其余：同名参数，调用torch.Param的weight_loader（没有weight_loader的话直接用默认加载器）
+    # weight_loader挂载参数对象上（由Linear/Embedding等层在参数创建时设置）
+    # 负责从完整的checkpoint张量里切出本rank的那一分，写到参数正确的位置
+    #
+    # 例（Qwen3，单卡）：
+    #   "model.layers.0.self_attn.q_proj.weight" [4096, 4096]
+    #     -> 规则 3：改名为 "model.layers.0.self_attn.qkv_proj.weight"，shard_id="q"
+    #     -> 写入 qkv_proj.weight [6144, 4096] 的第 0~4095 行
+    #   "model.layers.0.input_layernorm.weight" [4096]
+    #     -> 规则 4：同名参数，直接拷贝
     @_record_loaded_names
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
@@ -475,10 +597,13 @@ class BaseCausalLM(nn.Module):
                 name
             ):
                 # Experts this rank does not match belong to another EP rank.
+                # 本rank匹配不上的专家，属于另一个EP rank
                 if expert_loader.matches(name):
                     loaded.add(expert_loader.load(name, loaded_weight))
                 continue
 
+            # for ... else：break表示命中了规则3；
+            # 一条都没命中，才会进入else
             for param_name, weight_name, shard_id in stacked_params_mapping:
 
                 if weight_name not in name:
@@ -486,6 +611,7 @@ class BaseCausalLM(nn.Module):
 
                 name = name.replace(weight_name, param_name)
 
+                # 模型不用bias，但checkpoint带了bias，直接跳过
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
@@ -511,11 +637,13 @@ class BaseCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded.add(name)
 
+        # 全部权重加载完成后，开始其他任务，比如转成kernel要求的布局
         self.post_load_weights()
         return loaded
 
     # Live weight updates (see the class docstring).
 
+    # 完整更新需要的规范 checkpoint 名字
     def required_weight_update_names(self) -> set[str]:
         """Canonical checkpoint names required for a complete model update.
 
@@ -527,6 +655,7 @@ class BaseCausalLM(nn.Module):
             f"{type(self).__name__} does not support complete weight updates"
         )
 
+    # 丢弃权重后必须保留
     def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
         """Non-checkpoint tensors that must survive discarded weight storage.
 
